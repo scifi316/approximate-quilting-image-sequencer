@@ -1,6 +1,11 @@
 #Rust generates
 /target
+Cargo.lock
+Cargo.toml
+/src/*.rs
 
+#Python generates
+/.venv
 
 #VSCode
-.vscode
+/.vscode
