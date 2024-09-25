@@ -1,0 +1,6 @@
+#Rust generates
+/target
+
+
+#VSCode
+.vscode
