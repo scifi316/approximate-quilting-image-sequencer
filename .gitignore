@@ -9,3 +9,13 @@ Cargo.toml
 
 #VSCode
 /.vscode
+
+#Prototypes
+/src/tests/proto/*.py
+
+#Images
+/data/images/input
+
+#Binaries
+*.npy
+*.bin
