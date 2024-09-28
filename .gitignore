@@ -2,10 +2,11 @@
 /target
 Cargo.lock
 Cargo.toml
-/src/*.rs
+./src/*.rs
 
 #Python generates
 /.venv
+/.conda
 
 #VSCode
 /.vscode
@@ -17,5 +18,5 @@ Cargo.toml
 /data/images/input
 
 #Binaries
-*.npy
-*.bin
+/*.npy
+/*.bin
