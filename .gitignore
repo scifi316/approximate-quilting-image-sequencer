@@ -12,7 +12,7 @@ Cargo.toml
 /.vscode
 
 #Prototypes
-/src/tests/proto/*.py
+#/src/tests/proto/*.py
 
 #Images
 /data/images/input
