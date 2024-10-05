@@ -15,8 +15,10 @@ Cargo.toml
 #/src/tests/proto/*.py
 
 #Images
-/data/images/input
+/data/images/
+/data/*.png
 
-#Binaries
+#Files
 /*.npy
 /*.bin
+/*.png
