@@ -26,20 +26,27 @@ def buildDatabase(mv_frames_folder):
             keypoints, descriptors = sift.detectAndCompute(gray_frame, None)
 
             if descriptors is not None and len(descriptors) > 0:
+                # Ensure all descriptors have the correct dimensionality
+                descriptor_dim = descriptors.shape[1]
+                if descriptor_dim != 128:
+                    print(f"Skipping {filename}: Descriptor dimension {descriptor_dim} does not match expected dimension 128.")
+                    continue
+
                 # Append all descriptors to the list
                 descriptors_list.append(descriptors)
 
                 # Track which frame these descriptors belong to
                 frame_to_descriptor_indices.extend([frame_idx] * len(descriptors))
 
-                # Store the frame ID
-                frame_ids.append(filename)
+                # Store the frame ID if not already stored (one per frame)
+                if frame_idx >= len(frame_ids):
+                    frame_ids.append(filename)
 
     # Concatenate all descriptors into a single NumPy array
     all_descriptors = np.vstack(descriptors_list).astype('float32')
 
     # Create the Faiss index for all individual descriptors
-    faiss_index = faiss.IndexFlatL2(all_descriptors.shape[1])
+    faiss_index = faiss.IndexFlatL2(all_descriptors.shape[1])  # Assuming descriptors are 128-dimensional
     faiss_index.add(all_descriptors)
 
     # Save the Faiss index, frame IDs, and descriptor-to-frame mapping
@@ -50,7 +57,7 @@ def buildDatabase(mv_frames_folder):
     return faiss_index, frame_ids, frame_to_descriptor_indices
 
 mv_frames_folder = root_dir/'data/images/input'
-master_database, frame_ids = buildDatabase(mv_frames_folder)
+master_database, frame_ids, frame_to_descriptor_indices = buildDatabase(mv_frames_folder)
 
 # Create a Faiss index (using L2 distance for simplicity)
 try:

@@ -26,36 +26,55 @@ def detectFeatures(image_chunk):
     
     return des
 
-def matchFeatures(descriptors, faiss_index, frame_ids, expected_dimension=128):
-    """Match the descriptors of a chunk to the aggregated index of MV frames."""
+def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=5):
+    """Match the descriptors of a chunk to the individual descriptors in the Faiss index using a voting mechanism."""
     if descriptors is None or len(descriptors) == 0:
         return None, None  # No features detected
 
-    # Aggregate descriptors (e.g., using mean pooling)
-    aggregated_vector = np.mean(descriptors, axis=0).astype('float32')
-
-    # Zero-pad the vector if its dimension is smaller than the expected dimension
-    if aggregated_vector.shape[0] < expected_dimension:
-        padded_vector = np.zeros(expected_dimension, dtype='float32')
-        padded_vector[:aggregated_vector.shape[0]] = aggregated_vector
-        aggregated_vector = padded_vector
-
-    # Ensure the vector has the correct shape for the Faiss index
-    aggregated_vector = aggregated_vector.reshape(1, -1)
-
-    # Check dimension consistency
-    if aggregated_vector.shape[1] != faiss_index.d:
-        print(f"Error: Aggregated vector dimension {aggregated_vector.shape[1]} does not match Faiss index dimension {faiss_index.d}.")
+    # Zero-pad the descriptors if their dimensionality is less than the expected dimension
+    descriptor_dim = descriptors.shape[1]
+    if descriptor_dim < faiss_index.d:
+        padded_descriptors = np.zeros((descriptors.shape[0], faiss_index.d), dtype='float32')
+        padded_descriptors[:, :descriptor_dim] = descriptors
+        descriptors = padded_descriptors
+    elif descriptor_dim != faiss_index.d:
+        print(f"Error: Descriptor dimension {descriptor_dim} does not match Faiss index dimension {faiss_index.d}.")
         return None, None
 
-    # Perform the search in Faiss (find the 1 nearest neighbor)
-    distances, indices = faiss_index.search(aggregated_vector, 1)
+    # Perform the search in Faiss (find the top_k nearest neighbors for each descriptor)
+    distances, indices = faiss_index.search(descriptors, top_k)
 
-    # Get the frame ID of the best match
-    best_match_index = indices[0][0]
-    best_match_frame_id = frame_ids[best_match_index]
+    # Collect votes for each frame
+    votes = []
+    for i in range(len(indices)):
+        for j in range(top_k):
+            descriptor_index = indices[i, j]
+            
+            # Ensure descriptor_index is valid
+            if descriptor_index >= len(frame_to_descriptor_indices):
+                print(f"Error: descriptor_index {descriptor_index} is out of bounds for frame_to_descriptor_indices of length {len(frame_to_descriptor_indices)}.")
+                continue
+            
+            frame_index = frame_to_descriptor_indices[descriptor_index]
+            
+            # Ensure frame_index is valid
+            if frame_index >= len(frame_ids):
+                #print(f"Error: frame_index {frame_index} is out of bounds for frame_ids of length {len(frame_ids)}.")
+                continue
+            
+            votes.append(frame_ids[frame_index])  # Convert to frame ID
 
-    return best_match_frame_id, distances[0][0]
+    # Determine the most common frame ID
+    if votes:
+        most_common_frame, vote_count = Counter(votes).most_common(1)[0]
+        return most_common_frame, vote_count
+    else:
+        print("Warning: No valid matches found, using fallback mechanism.")
+        return fallbackFrame(frame_ids), 0
+
+def fallbackFrame(frame_ids):
+    """Fallback mechanism to select a default frame if no valid match is found."""
+    return frame_ids[0] if frame_ids else None
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -66,7 +85,7 @@ def processChunk(chunk_info, faiss_index, frame_ids):
     
     return (x, y, best_match_frame_id, match_score)
 
-def parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=8):
+def parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=5):
     """Run feature detection and matching in parallel on all image chunks."""
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         results = list(executor.map(lambda chunk: processChunk(chunk, faiss_index, frame_ids), image_chunks))
@@ -91,7 +110,7 @@ def getResizedFrame(frame_index, mv_frames_folder):
     
     return resized_frame
 
-def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width=240, chunk_height=180):
+def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width=96, chunk_height=72):
     """Quilt together the best-matching frames into the target image's shape."""
     h, w = target_image_shape[:2]
     quilted_image = np.zeros((h, w, 3), dtype=np.uint8)
@@ -122,36 +141,43 @@ def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width=
     
     return quilted_image
 
-def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, mv_frames_folder, chunk_width=96, chunk_height=72):
-    # Load the Faiss index
+def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder, chunk_width=96, chunk_height=72):
+    # Load the Faiss index, frame IDs, and descriptor-to-frame mapping
     faiss_index = faiss.read_index(faiss_index_path)
     frame_ids = np.load(frame_ids_path)
-    
+    frame_to_descriptor_indices = np.load(descriptor_indices_path)
+
     # Load the target image
     target_image = cv2.imread(target_image_path)
 
     # Split the target image into chunks
     image_chunks = splitImage(target_image, chunk_width, chunk_height)
 
-    # Process the chunks in parallel
-    chunk_results = parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=8)  # Adjust num_workers as needed
+    # Process the chunks using the voting mechanism
+    chunk_results = []
+    for chunk in image_chunks:
+        x, y, chunk_data = chunk
+        descriptors = detectFeatures(chunk_data)
+        best_match_frame_id, match_score = matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices)
+        chunk_results.append((x, y, best_match_frame_id, match_score))
 
     # Quilt the final image using the matched frames
     quilted_image = quiltImage(chunk_results, mv_frames_folder, target_image.shape, chunk_width, chunk_height)
 
     # Save and display the quilted image
-    output_image_path = root_dir/f"data/images/quilted_output/quilted_frame{i:04d}.png"
+    output_image_path = root_dir/f"data/images/quilted_output2/quilted_frame{i:04d}.png"
     cv2.imwrite(output_image_path, quilted_image)
     #cv2.imshow('Quilted Image', quilted_image)
     #cv2.waitKey(0)
     #cv2.destroyAllWindows()
-    
+
     #print(f"Quilted image saved to {output_image_path}")
     
-target_image_path = root_dir/'data/images/source'
-faiss_index_path = 'aggregated_faiss_index.bin'
+target_image_path = root_dir/'data/images/source2'
+faiss_index_path = 'individual_descriptors_faiss_index.bin'
 frame_ids_path = 'frame_ids.npy'
 mv_frames_folder = root_dir/'data/images/input'
+descriptor_indices_path = 'frame_to_descriptor_indices.npy'
 
 # Run the main function
 #processTargetImage(target_image_path, faiss_index_path, frame_ids_path, mv_frames_folder)
@@ -159,7 +185,7 @@ i = 1
 for filename in sorted(os.listdir(target_image_path)):
     if filename.lower().endswith('.png'):
         target_image = os.path.join(target_image_path, filename)
-        processTargetImage(target_image, faiss_index_path, frame_ids_path, mv_frames_folder)
+        processTargetImage(target_image, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder)
         i += 1
         
 print("Quilted all images")
