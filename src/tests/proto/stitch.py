@@ -26,7 +26,7 @@ def detectFeatures(image_chunk):
     
     return des
 
-def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=5):
+def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=7):
     """Match the descriptors of a chunk to the individual descriptors in the Faiss index using a voting mechanism."""
     if descriptors is None or len(descriptors) == 0:
         return None, None  # No features detected
@@ -85,7 +85,7 @@ def processChunk(chunk_info, faiss_index, frame_ids):
     
     return (x, y, best_match_frame_id, match_score)
 
-def parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=5):
+def parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=8):
     """Run feature detection and matching in parallel on all image chunks."""
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         results = list(executor.map(lambda chunk: processChunk(chunk, faiss_index, frame_ids), image_chunks))
@@ -110,7 +110,7 @@ def getResizedFrame(frame_index, mv_frames_folder):
     
     return resized_frame
 
-def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width=96, chunk_height=72):
+def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width, chunk_height):
     """Quilt together the best-matching frames into the target image's shape."""
     h, w = target_image_shape[:2]
     quilted_image = np.zeros((h, w, 3), dtype=np.uint8)
@@ -165,7 +165,7 @@ def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, desc
     quilted_image = quiltImage(chunk_results, mv_frames_folder, target_image.shape, chunk_width, chunk_height)
 
     # Save and display the quilted image
-    output_image_path = root_dir/f"data/images/quilted_output2/quilted_frame{i:04d}.png"
+    output_image_path = root_dir/f"data/images/quilted_output/quilted_frame{i:04d}.png"
     cv2.imwrite(output_image_path, quilted_image)
     #cv2.imshow('Quilted Image', quilted_image)
     #cv2.waitKey(0)
@@ -173,7 +173,7 @@ def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, desc
 
     #print(f"Quilted image saved to {output_image_path}")
     
-target_image_path = root_dir/'data/images/source2'
+target_image_path = root_dir/'data/images/source'
 faiss_index_path = 'individual_descriptors_faiss_index.bin'
 frame_ids_path = 'frame_ids.npy'
 mv_frames_folder = root_dir/'data/images/input'

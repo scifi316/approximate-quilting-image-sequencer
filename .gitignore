@@ -22,3 +22,5 @@ Cargo.toml
 /*.npy
 /*.bin
 /*.png
+/src/database/*.bin
+/src/database/*.npy
