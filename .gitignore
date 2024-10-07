@@ -24,3 +24,4 @@ Cargo.toml
 /*.png
 /src/database/*.bin
 /src/database/*.npy
+/src/tests/proto/test.py

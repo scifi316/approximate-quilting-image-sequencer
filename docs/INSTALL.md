@@ -62,7 +62,7 @@ We should now have a proper working environemnt to run, test, and debug in.
 ### Modifying and testing
 __NOTE:__ Make sure you use the "activated" terminal to run the python files as it may fail to load the necessary libraries during certain steps.
 
-Any changes made to the input database located in `/data/images/input` requires a rebuild of the database binaries and headings. To accomplish such, navigate to the folder `/src/database/` and run the `build_database.py` to rebuild the database, this will take some time but should generate new binaries/headings.
+Any changes made to the input database located in `/data/images/input` requires a rebuild of the database binaries and headings. To accomplish such, navigate to the folder `/src/test/proto` and run the `poc1.py` file to rebuild the database, this will take some time but should generate the new binaries/headings.
 
 To generate a video, make sure [FFMPEG](https://www.ffmpeg.org/download.html) is already installed on your system. This program works by sequentially generating each frame from a source video using the database of images given. 
 

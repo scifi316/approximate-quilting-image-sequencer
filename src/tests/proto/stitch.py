@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 from collections import Counter
 
+# Root directory solve
 root_dir = Path(__file__).resolve().parents[3]
 
 def splitImage(image, chunk_width, chunk_height):
@@ -19,6 +20,8 @@ def splitImage(image, chunk_width, chunk_height):
     
     return chunks
 
+# Detect features using the ORB detector (should probably use SIFT or SURF for better performance and proper dimensionality)
+# FIXME: modify detect structure, get better performance
 def detectFeatures(image_chunk):
     orb = cv2.ORB_create()
     gray_chunk = cv2.cvtColor(image_chunk, cv2.COLOR_BGR2GRAY)
@@ -26,6 +29,8 @@ def detectFeatures(image_chunk):
     
     return des
 
+# Match the detected features to the individual descriptors in the Faiss index using a voting mechanism
+# FIXME: modify match algorithm to utilize GPU and solving generation issues/memory performance
 def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=7):
     """Match the descriptors of a chunk to the individual descriptors in the Faiss index using a voting mechanism."""
     if descriptors is None or len(descriptors) == 0:
@@ -72,6 +77,7 @@ def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indic
         print("Warning: No valid matches found, using fallback mechanism.")
         return fallbackFrame(frame_ids), 0
 
+# Fallback mechanism will select the first frame ID, typically a black frame
 def fallbackFrame(frame_ids):
     """Fallback mechanism to select a default frame if no valid match is found."""
     return frame_ids[0] if frame_ids else None
@@ -85,6 +91,7 @@ def processChunk(chunk_info, faiss_index, frame_ids):
     
     return (x, y, best_match_frame_id, match_score)
 
+# NOTE: This will be deprecated in favor of a more efficient parallel processing method in processing/matching
 def parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=8):
     """Run feature detection and matching in parallel on all image chunks."""
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -141,6 +148,7 @@ def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width,
     
     return quilted_image
 
+# FIXME: clean up code for readability and performance
 def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder, chunk_width=96, chunk_height=72):
     # Load the Faiss index, frame IDs, and descriptor-to-frame mapping
     faiss_index = faiss.read_index(faiss_index_path)
@@ -173,6 +181,7 @@ def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, desc
 
     #print(f"Quilted image saved to {output_image_path}")
     
+# Define the paths to the target image, Faiss index, frame IDs, and MV frames
 target_image_path = root_dir/'data/images/source'
 faiss_index_path = 'individual_descriptors_faiss_index.bin'
 frame_ids_path = 'frame_ids.npy'

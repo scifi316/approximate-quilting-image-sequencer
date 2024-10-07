@@ -13,7 +13,7 @@ def buildDatabase(mv_frames_folder):
     frame_to_descriptor_indices = []  # To keep track of which descriptors belong to which frames
     frame_ids = []
 
-    # Initialize SIFT detector
+    # Initialize SIFT detector, ORB may work but doesnt currently work with translating dimensions in numpy
     sift = cv2.SIFT_create()
 
     for frame_idx, filename in enumerate(sorted(os.listdir(mv_frames_folder))):
@@ -59,7 +59,7 @@ def buildDatabase(mv_frames_folder):
 mv_frames_folder = root_dir/'data/images/input'
 master_database, frame_ids, frame_to_descriptor_indices = buildDatabase(mv_frames_folder)
 
-# Create a Faiss index (using L2 distance for simplicity)
+# Create a Faiss index with L2 distance metric
 try:
     # Create the Faiss index with the correct dimensionality
     faiss_index = faiss.IndexFlatL2(master_database.shape[1])
