@@ -181,20 +181,21 @@ def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, desc
 
     #print(f"Quilted image saved to {output_image_path}")
     
-# Define the paths to the target image, Faiss index, frame IDs, and MV frames
-target_image_path = root_dir/'data/images/source'
-faiss_index_path = 'individual_descriptors_faiss_index.bin'
-frame_ids_path = 'frame_ids.npy'
-mv_frames_folder = root_dir/'data/images/input'
-descriptor_indices_path = 'frame_to_descriptor_indices.npy'
+if __name__ == "__main__":
+    # Define the paths to the target image, Faiss index, frame IDs, and MV frames
+    target_image_path = root_dir/'data/images/source'
+    faiss_index_path = 'individual_descriptors_faiss_index.bin'
+    frame_ids_path = 'frame_ids.npy'
+    mv_frames_folder = root_dir/'data/images/input'
+    descriptor_indices_path = 'frame_to_descriptor_indices.npy'
 
-# Run the main function
-#processTargetImage(target_image_path, faiss_index_path, frame_ids_path, mv_frames_folder)
-i = 1
-for filename in sorted(os.listdir(target_image_path)):
-    if filename.lower().endswith('.png'):
-        target_image = os.path.join(target_image_path, filename)
-        processTargetImage(target_image, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder)
-        i += 1
-        
-print("Quilted all images")
+    # Run the main function
+    #processTargetImage(target_image_path, faiss_index_path, frame_ids_path, mv_frames_folder)
+    i = 1
+    for filename in sorted(os.listdir(target_image_path)):
+        if filename.lower().endswith('.png'):
+            target_image = os.path.join(target_image_path, filename)
+            processTargetImage(target_image, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder)
+            i += 1
+
+    print("Quilted all images")
