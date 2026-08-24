@@ -1,0 +1,86 @@
+import cv2
+import numpy as np
+
+import build_database
+
+
+def _make_checkerboard(size=64, square=8):
+    """A high-contrast synthetic image SIFT reliably finds keypoints in."""
+    board = np.zeros((size, size), dtype=np.uint8)
+    for i in range(0, size, square):
+        for j in range(0, size, square):
+            if (i // square + j // square) % 2 == 0:
+                board[i:i + square, j:j + square] = 255
+    return cv2.cvtColor(board, cv2.COLOR_GRAY2BGR)
+
+
+def _make_blank(size=64):
+    """A featureless image: SIFT detects zero keypoints on this."""
+    return np.zeros((size, size, 3), dtype=np.uint8)
+
+
+class TestBuildDatabase:
+    def test_indexes_descriptors_and_maps_them_back_to_their_frame(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_checkerboard())
+        cv2.imwrite(str(input_dir / "frame0001.png"), _make_checkerboard(square=16))
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir
+        )
+
+        assert list(frame_ids) == ["frame0000.png", "frame0001.png"]
+        assert faiss_index.ntotal == len(frame_to_descriptor_indices)
+        assert faiss_index.d == build_database.DESCRIPTOR_DIM
+
+        # Every descriptor's recorded frame index must resolve to a real frame.
+        assert all(0 <= idx < len(frame_ids) for idx in frame_to_descriptor_indices)
+        # And every frame must have contributed at least one descriptor.
+        assert set(frame_to_descriptor_indices) == {0, 1}
+
+        assert (output_dir / "individual_descriptors_faiss_index.bin").exists()
+        assert (output_dir / "frame_ids.npy").exists()
+        assert (output_dir / "frame_to_descriptor_indices.npy").exists()
+
+    def test_skipped_frames_do_not_desync_the_descriptor_to_frame_mapping(self, tmp_path):
+        """A frame with no detectable features (or a non-image file) must be
+        skipped without leaving a gap between frame_ids and the frame indices
+        recorded in frame_to_descriptor_indices."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_blank())  # no keypoints -> skipped
+        cv2.imwrite(str(input_dir / "frame0001.png"), _make_checkerboard())
+        (input_dir / "notes.txt").write_text("not an image")  # filtered out entirely
+        cv2.imwrite(str(input_dir / "frame0002.png"), _make_checkerboard(square=16))
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        _, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir
+        )
+
+        # Only the two frames with detectable features are indexed.
+        assert list(frame_ids) == ["frame0001.png", "frame0002.png"]
+        # Every recorded frame index must point at one of those two frames --
+        # this fails if the blank/skipped frame still consumed an index slot.
+        assert set(frame_to_descriptor_indices) <= {0, 1}
+        assert set(frame_to_descriptor_indices) == {0, 1}
+
+    def test_empty_folder_produces_an_empty_but_valid_index(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir
+        )
+
+        assert frame_ids == []
+        assert frame_to_descriptor_indices == []
+        assert faiss_index.ntotal == 0

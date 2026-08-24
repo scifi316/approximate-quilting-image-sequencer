@@ -1,0 +1,4 @@
+# Extra dependencies for running the test suite (tests/), on top of the
+# project environment created from requirements.yml (which already
+# provides numpy, opencv, and faiss).
+pytest
