@@ -1,3 +1,4 @@
+import cv2
 import faiss
 import numpy as np
 import pytest
@@ -132,6 +133,109 @@ class TestMatchFeatures:
 
         assert frame == "only_frame.png"
         assert votes == 0
+
+
+class TestMatchFeaturesBatch:
+    def test_matches_each_chunk_independently_in_one_search_call(self, small_index, monkeypatch):
+        index, frame_ids, mapping, vectors = small_index
+
+        search_calls = []
+        original_search = index.search
+
+        def counting_search(*args, **kwargs):
+            search_calls.append(1)
+            return original_search(*args, **kwargs)
+
+        monkeypatch.setattr(index, "search", counting_search)
+
+        chunk_descriptors = [
+            vectors[0:1],  # frame_a
+            vectors[2:4],  # frame_b (both belong to it)
+            vectors[4:5],  # frame_c
+        ]
+
+        results = stitch.matchFeaturesBatch(chunk_descriptors, index, frame_ids, mapping, top_k=1)
+
+        assert len(search_calls) == 1  # one batched call, not one per chunk
+        assert results == [
+            ("frame_a.png", 1),
+            ("frame_b.png", 2),
+            ("frame_c.png", 1),
+        ]
+
+    def test_none_and_empty_chunks_yield_none_without_breaking_other_chunks(self, small_index):
+        index, frame_ids, mapping, vectors = small_index
+        chunk_descriptors = [None, vectors[0:1], np.empty((0, 4), dtype="float32")]
+
+        results = stitch.matchFeaturesBatch(chunk_descriptors, index, frame_ids, mapping, top_k=1)
+
+        assert results == [(None, None), ("frame_a.png", 1), (None, None)]
+
+    def test_all_chunks_invalid_returns_all_none(self, small_index):
+        index, frame_ids, mapping, _ = small_index
+        chunk_descriptors = [None, np.empty((0, 4), dtype="float32")]
+
+        results = stitch.matchFeaturesBatch(chunk_descriptors, index, frame_ids, mapping, top_k=1)
+
+        assert results == [(None, None), (None, None)]
+
+    def test_matches_matchFeatures_output_for_each_chunk(self, small_index):
+        index, frame_ids, mapping, vectors = small_index
+        chunk_descriptors = [vectors[0:1], vectors[2:4], vectors[4:5]]
+
+        batch_results = stitch.matchFeaturesBatch(chunk_descriptors, index, frame_ids, mapping, top_k=1)
+        individual_results = [
+            stitch.matchFeatures(d, index, frame_ids, mapping, top_k=1) for d in chunk_descriptors
+        ]
+
+        assert batch_results == individual_results
+
+
+class TestQuiltImage:
+    def test_missing_frame_file_fills_black_instead_of_crashing(self, tmp_path):
+        # cv2.imread returns None (not an exception) for a missing file, so
+        # quiltImage must check for None itself rather than catching
+        # FileNotFoundError, which cv2.imread never raises.
+        chunk_results = [(0, 0, "does_not_exist.png", 5)]
+
+        quilted = stitch.quiltImage(chunk_results, str(tmp_path), (2, 2, 3), chunk_width=2, chunk_height=2)
+
+        np.testing.assert_array_equal(quilted, np.zeros((2, 2, 3), dtype=np.uint8))
+
+    def test_none_match_is_skipped(self, tmp_path):
+        chunk_results = [(0, 0, None, None)]
+
+        quilted = stitch.quiltImage(chunk_results, str(tmp_path), (2, 2, 3), chunk_width=2, chunk_height=2)
+
+        np.testing.assert_array_equal(quilted, np.zeros((2, 2, 3), dtype=np.uint8))
+
+    def test_matched_frame_is_placed_at_its_chunk_position(self, tmp_path):
+        frame = np.full((4, 4, 3), 200, dtype=np.uint8)
+        cv2.imwrite(str(tmp_path / "frame.png"), frame)
+        chunk_results = [(2, 0, "frame.png", 3)]
+
+        quilted = stitch.quiltImage(chunk_results, str(tmp_path), (2, 4, 3), chunk_width=2, chunk_height=2)
+
+        np.testing.assert_array_equal(quilted[0:2, 2:4], np.full((2, 2, 3), 200, dtype=np.uint8))
+        np.testing.assert_array_equal(quilted[0:2, 0:2], np.zeros((2, 2, 3), dtype=np.uint8))
+
+    def test_repeated_matches_read_the_source_frame_from_disk_only_once(self, tmp_path, monkeypatch):
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        cv2.imwrite(str(tmp_path / "frame.png"), frame)
+
+        read_calls = []
+        original_imread = cv2.imread
+
+        def counting_imread(path, *args, **kwargs):
+            read_calls.append(path)
+            return original_imread(path, *args, **kwargs)
+
+        monkeypatch.setattr(cv2, "imread", counting_imread)
+
+        chunk_results = [(0, 0, "frame.png", 1), (2, 0, "frame.png", 1), (0, 2, "frame.png", 1)]
+        stitch.quiltImage(chunk_results, str(tmp_path), (4, 4, 3), chunk_width=2, chunk_height=2)
+
+        assert len(read_calls) == 1
 
 
 class TestFallbackFrame:

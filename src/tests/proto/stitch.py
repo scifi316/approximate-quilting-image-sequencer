@@ -3,10 +3,15 @@ import numpy as np
 import faiss
 from pathlib import Path
 import os
+import sys
 from collections import Counter
 
 # Root directory solve
-root_dir = Path(__file__).resolve().parents[3]
+root_dir = Path(__file__).resolve().parents[3]  # src/tests/proto --> $main dir
+sys.path.insert(0, str(root_dir))
+
+from src.common import list_image_files  # noqa: E402
+
 
 def splitImage(image, chunk_width, chunk_height):
     """Split an image into smaller chunks of the given size."""
@@ -17,185 +22,211 @@ def splitImage(image, chunk_width, chunk_height):
         for x in range(0, w, chunk_width):
             chunk = image[y:y + chunk_height, x:x + chunk_width]
             chunks.append((x, y, chunk))
-    
+
     return chunks
 
-# Detect features using the ORB detector (should probably use SIFT or SURF for better performance and proper dimensionality)
-# FIXME: modify detect structure, get better performance
-def detectFeatures(image_chunk):
-    orb = cv2.ORB_create()
+
+def detectFeatures(image_chunk, detector=None):
+    """Detect SIFT features in an image chunk.
+
+    SIFT is used (rather than ORB) because the database built by
+    build_database.py is indexed on 128-D SIFT descriptors; matching with a
+    different descriptor type/dimensionality produces meaningless results.
+    Pass a shared `detector` to avoid the overhead of constructing a new
+    cv2.SIFT instance for every chunk.
+    """
+    detector = detector or cv2.SIFT_create()
     gray_chunk = cv2.cvtColor(image_chunk, cv2.COLOR_BGR2GRAY)
-    kp, des = orb.detectAndCompute(gray_chunk, None)
-    
-    return des
+    _, descriptors = detector.detectAndCompute(gray_chunk, None)
 
-# Match the detected features to the individual descriptors in the Faiss index using a voting mechanism
-# FIXME: modify match algorithm to utilize GPU and solving generation issues/memory performance
-def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=7):
-    """Match the descriptors of a chunk to the individual descriptors in the Faiss index using a voting mechanism."""
-    if descriptors is None or len(descriptors) == 0:
-        return None, None  # No features detected
+    return descriptors
 
-    # Zero-pad the descriptors if their dimensionality is less than the expected dimension
+
+def _padOrValidateDescriptors(descriptors, faiss_index):
+    """Zero-pad descriptors up to the index's dimensionality if they're
+    smaller, or return None if the dimensionality can't be reconciled."""
     descriptor_dim = descriptors.shape[1]
     if descriptor_dim < faiss_index.d:
         padded_descriptors = np.zeros((descriptors.shape[0], faiss_index.d), dtype='float32')
         padded_descriptors[:, :descriptor_dim] = descriptors
-        descriptors = padded_descriptors
-    elif descriptor_dim != faiss_index.d:
+        return padded_descriptors
+    if descriptor_dim != faiss_index.d:
         print(f"Error: Descriptor dimension {descriptor_dim} does not match Faiss index dimension {faiss_index.d}.")
+        return None
+    return descriptors
+
+
+def _votesFromIndices(indices, frame_ids, frame_to_descriptor_indices):
+    """Turn a batch of Faiss neighbor indices into a flat list of frame-ID votes."""
+    votes = []
+    for row in indices:
+        for descriptor_index in row:
+            if descriptor_index >= len(frame_to_descriptor_indices):
+                print(f"Error: descriptor_index {descriptor_index} is out of bounds for "
+                      f"frame_to_descriptor_indices of length {len(frame_to_descriptor_indices)}.")
+                continue
+
+            frame_index = frame_to_descriptor_indices[descriptor_index]
+
+            if frame_index >= len(frame_ids):
+                continue
+
+            votes.append(frame_ids[frame_index])
+    return votes
+
+
+# Match the detected features to the individual descriptors in the Faiss index using a voting mechanism
+def matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=7):
+    """Match the descriptors of a single chunk to the Faiss index using a voting mechanism."""
+    if descriptors is None or len(descriptors) == 0:
+        return None, None  # No features detected
+
+    descriptors = _padOrValidateDescriptors(descriptors, faiss_index)
+    if descriptors is None:
         return None, None
 
-    # Perform the search in Faiss (find the top_k nearest neighbors for each descriptor)
-    distances, indices = faiss_index.search(descriptors, top_k)
+    _, indices = faiss_index.search(descriptors, top_k)
+    votes = _votesFromIndices(indices, frame_ids, frame_to_descriptor_indices)
 
-    # Collect votes for each frame
-    votes = []
-    for i in range(len(indices)):
-        for j in range(top_k):
-            descriptor_index = indices[i, j]
-            
-            # Ensure descriptor_index is valid
-            if descriptor_index >= len(frame_to_descriptor_indices):
-                print(f"Error: descriptor_index {descriptor_index} is out of bounds for frame_to_descriptor_indices of length {len(frame_to_descriptor_indices)}.")
-                continue
-            
-            frame_index = frame_to_descriptor_indices[descriptor_index]
-            
-            # Ensure frame_index is valid
-            if frame_index >= len(frame_ids):
-                #print(f"Error: frame_index {frame_index} is out of bounds for frame_ids of length {len(frame_ids)}.")
-                continue
-            
-            votes.append(frame_ids[frame_index])  # Convert to frame ID
-
-    # Determine the most common frame ID
     if votes:
-        most_common_frame, vote_count = Counter(votes).most_common(1)[0]
-        return most_common_frame, vote_count
-    else:
-        print("Warning: No valid matches found, using fallback mechanism.")
-        return fallbackFrame(frame_ids), 0
+        return Counter(votes).most_common(1)[0]
+
+    print("Warning: No valid matches found, using fallback mechanism.")
+    return fallbackFrame(frame_ids), 0
+
+
+def matchFeaturesBatch(chunk_descriptors, faiss_index, frame_ids, frame_to_descriptor_indices, top_k=7):
+    """Batched version of matchFeatures: matches many chunks' descriptors with
+    a single Faiss search call instead of one call per chunk. This is the
+    matching hot path used by processTargetImage -- for a target image split
+    into hundreds of chunks, one batched search is far cheaper than hundreds
+    of individual ones.
+
+    Returns a list of (frame_id, vote_count) tuples, one per entry in
+    chunk_descriptors, in the same order.
+    """
+    results = [(None, None)] * len(chunk_descriptors)
+
+    prepared_descriptors, chunk_positions, chunk_sizes = [], [], []
+    for position, descriptors in enumerate(chunk_descriptors):
+        if descriptors is None or len(descriptors) == 0:
+            continue
+
+        prepared = _padOrValidateDescriptors(descriptors, faiss_index)
+        if prepared is None:
+            continue
+
+        prepared_descriptors.append(prepared)
+        chunk_positions.append(position)
+        chunk_sizes.append(prepared.shape[0])
+
+    if not prepared_descriptors:
+        return results
+
+    all_descriptors = np.vstack(prepared_descriptors).astype('float32')
+    _, indices = faiss_index.search(all_descriptors, top_k)
+
+    offset = 0
+    for position, size in zip(chunk_positions, chunk_sizes):
+        chunk_indices = indices[offset:offset + size]
+        offset += size
+
+        votes = _votesFromIndices(chunk_indices, frame_ids, frame_to_descriptor_indices)
+        if votes:
+            results[position] = Counter(votes).most_common(1)[0]
+        else:
+            results[position] = (fallbackFrame(frame_ids), 0)
+
+    return results
+
 
 # Fallback mechanism will select the first frame ID, typically a black frame
 def fallbackFrame(frame_ids):
     """Fallback mechanism to select a default frame if no valid match is found."""
     return frame_ids[0] if frame_ids else None
 
-from concurrent.futures import ThreadPoolExecutor
-
-def processChunk(chunk_info, faiss_index, frame_ids):
-    x, y, chunk = chunk_info
-    descriptors = detectFeatures(chunk)
-    best_match_frame_id, match_score = matchFeatures(descriptors, faiss_index, frame_ids)
-    
-    return (x, y, best_match_frame_id, match_score)
-
-# NOTE: This will be deprecated in favor of a more efficient parallel processing method in processing/matching
-def parallelProcessChunks(image_chunks, faiss_index, frame_ids, num_workers=8):
-    """Run feature detection and matching in parallel on all image chunks."""
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        results = list(executor.map(lambda chunk: processChunk(chunk, faiss_index, frame_ids), image_chunks))
-        
-    return results
-
-def getResizedFrame(frame_index, mv_frames_folder):
-    if frame_index is None:
-        raise ValueError("Received None as frame_index, cannot retrieve frame.")
-    
-    frame_filename = f"output_frames{frame_index:04d}.png"
-    frame_path = f"{mv_frames_folder}/{frame_filename}"
-    
-    mv_frame = cv2.imread(frame_path)
-    
-    # Check if the frame was successfully loaded
-    if mv_frame is None:
-        raise FileNotFoundError(f"Frame {frame_path} not found.")
-    
-    # Resize the MV frame to the target chunk size
-    resized_frame = cv2.resize(mv_frame, (240, 180))
-    
-    return resized_frame
 
 def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width, chunk_height):
     """Quilt together the best-matching frames into the target image's shape."""
     h, w = target_image_shape[:2]
     quilted_image = np.zeros((h, w, 3), dtype=np.uint8)
-    
+
+    # Many chunks in the same target image often match the same source
+    # frame; cache each frame's resized version instead of re-reading and
+    # re-resizing it from disk on every chunk.
+    resized_frame_cache = {}
+
     for x, y, match_frame_id, _ in chunk_results:
         if match_frame_id is None:
             # Skip this chunk if no valid match was found
-            #print(f"Skipping chunk at ({x}, {y}) due to no valid match.")
             continue
 
-        try:
-            # Construct the path to the matched frame
+        if match_frame_id not in resized_frame_cache:
             frame_path = os.path.join(mv_frames_folder, match_frame_id)
             mv_frame = cv2.imread(frame_path)
-            
-            # Resize the MV frame to fit the chunk size (chunk_width, chunk_height)
-            resized_frame = cv2.resize(mv_frame, (chunk_width, chunk_height))
-            
-            # Place the resized frame into the quilted image
+            if mv_frame is None:
+                print(f"Frame {frame_path} not found.")
+                resized_frame_cache[match_frame_id] = None
+            else:
+                resized_frame_cache[match_frame_id] = cv2.resize(mv_frame, (chunk_width, chunk_height))
+
+        resized_frame = resized_frame_cache[match_frame_id]
+        if resized_frame is None:
+            # Fill in a default color for missing frames
+            quilted_image[y:y + chunk_height, x:x + chunk_width] = (0, 0, 0)
+        else:
             quilted_image[y:y + chunk_height, x:x + chunk_width] = resized_frame
-            
-            #print(f"Quilted chunk at ({x}, {y}) with frame {match_frame_id}")
-        
-        except FileNotFoundError as e:
-            print(e)
-            # Optionally fill in a default color for missing frames
-            quilted_image[y:y + chunk_height, x:x + chunk_width] = (0, 0, 0)  # Filling with black
-    
+
     return quilted_image
 
-# FIXME: clean up code for readability and performance
-def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder, chunk_width=96, chunk_height=72):
+
+def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path,
+                        mv_frames_folder, output_index, output_dir, chunk_width=96, chunk_height=72,
+                        detector=None):
     # Load the Faiss index, frame IDs, and descriptor-to-frame mapping
-    faiss_index = faiss.read_index(faiss_index_path)
+    faiss_index = faiss.read_index(str(faiss_index_path))
     frame_ids = np.load(frame_ids_path)
     frame_to_descriptor_indices = np.load(descriptor_indices_path)
 
     # Load the target image
-    target_image = cv2.imread(target_image_path)
+    target_image = cv2.imread(str(target_image_path))
+    if target_image is None:
+        raise FileNotFoundError(f"Target image {target_image_path} not found.")
 
     # Split the target image into chunks
     image_chunks = splitImage(target_image, chunk_width, chunk_height)
+    detector = detector or cv2.SIFT_create()
 
-    # Process the chunks using the voting mechanism
-    chunk_results = []
-    for chunk in image_chunks:
-        x, y, chunk_data = chunk
-        descriptors = detectFeatures(chunk_data)
-        best_match_frame_id, match_score = matchFeatures(descriptors, faiss_index, frame_ids, frame_to_descriptor_indices)
-        chunk_results.append((x, y, best_match_frame_id, match_score))
+    # Detect features per chunk, then match all chunks in a single batched Faiss search
+    chunk_descriptors = [detectFeatures(chunk_data, detector) for _, _, chunk_data in image_chunks]
+    matches = matchFeaturesBatch(chunk_descriptors, faiss_index, frame_ids, frame_to_descriptor_indices)
+
+    chunk_results = [
+        (x, y, match_frame_id, match_score)
+        for (x, y, _), (match_frame_id, match_score) in zip(image_chunks, matches)
+    ]
 
     # Quilt the final image using the matched frames
     quilted_image = quiltImage(chunk_results, mv_frames_folder, target_image.shape, chunk_width, chunk_height)
 
-    # Save and display the quilted image
-    output_image_path = root_dir/f"data/images/quilted_output/quilted_frame{i:04d}.png"
-    cv2.imwrite(output_image_path, quilted_image)
-    #cv2.imshow('Quilted Image', quilted_image)
-    #cv2.waitKey(0)
-    #cv2.destroyAllWindows()
+    # Save the quilted image
+    output_image_path = Path(output_dir) / f"quilted_frame{output_index:04d}.png"
+    cv2.imwrite(str(output_image_path), quilted_image)
 
-    #print(f"Quilted image saved to {output_image_path}")
-    
+
 if __name__ == "__main__":
     # Define the paths to the target image, Faiss index, frame IDs, and MV frames
-    target_image_path = root_dir/'data/images/source'
-    faiss_index_path = 'individual_descriptors_faiss_index.bin'
-    frame_ids_path = 'frame_ids.npy'
-    mv_frames_folder = root_dir/'data/images/input'
-    descriptor_indices_path = 'frame_to_descriptor_indices.npy'
+    target_image_path = root_dir / 'data/images/source'
+    faiss_index_path = root_dir / 'individual_descriptors_faiss_index.bin'
+    frame_ids_path = root_dir / 'frame_ids.npy'
+    mv_frames_folder = root_dir / 'data/images/input'
+    descriptor_indices_path = root_dir / 'frame_to_descriptor_indices.npy'
+    output_dir = root_dir / 'data/images/quilted_output'
 
-    # Run the main function
-    #processTargetImage(target_image_path, faiss_index_path, frame_ids_path, mv_frames_folder)
-    i = 1
-    for filename in sorted(os.listdir(target_image_path)):
-        if filename.lower().endswith('.png'):
-            target_image = os.path.join(target_image_path, filename)
-            processTargetImage(target_image, faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder)
-            i += 1
+    shared_detector = cv2.SIFT_create()
+    for output_index, filename in enumerate(list_image_files(target_image_path), start=1):
+        target_image = os.path.join(target_image_path, filename)
+        processTargetImage(target_image, faiss_index_path, frame_ids_path, descriptor_indices_path,
+                            mv_frames_folder, output_index, output_dir, detector=shared_detector)
 
     print("Quilted all images")
