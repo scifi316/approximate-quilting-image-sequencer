@@ -1,16 +1,33 @@
 import os
+import re
 
 import cv2
 import numpy as np
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
 
+_DIGIT_RUN = re.compile(r'(\d+)')
+
+
+def _naturalSortKey(filename):
+    """Sort key that orders embedded numbers by value, not character-by-
+    character -- plain lexicographic sort would order "frame10.png" before
+    "frame2.png" (since '1' < '2'), which silently scrambles playback order
+    for any frame sequence whose filenames aren't zero-padded to a fixed
+    width. Zero-pads each digit run to a large fixed width instead of
+    parsing it to int, so the key stays all-strings (safe to sort/compare
+    even if folder contents mix differently-structured filenames) while
+    still comparing numeric runs by value.
+    """
+    return [part.zfill(20) if part.isdigit() else part for part in _DIGIT_RUN.split(filename)]
+
 
 def list_image_files(folder):
-    """Return sorted image filenames (png/jpg/jpeg) in the given folder."""
+    """Return image filenames (png/jpg/jpeg) in the given folder, in natural
+    (numeric-aware) sorted order -- see _naturalSortKey."""
     return sorted(
-        filename for filename in os.listdir(folder)
-        if filename.lower().endswith(IMAGE_EXTENSIONS)
+        (filename for filename in os.listdir(folder) if filename.lower().endswith(IMAGE_EXTENSIONS)),
+        key=_naturalSortKey,
     )
 
 

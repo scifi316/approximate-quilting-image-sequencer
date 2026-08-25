@@ -1,7 +1,40 @@
 import numpy as np
 import pytest
 
-from src.common import computeTileDescriptors, tileDescriptorDim
+from src.common import computeTileDescriptors, list_image_files, tileDescriptorDim
+
+
+class TestListImageFiles:
+    def test_non_zero_padded_numeric_filenames_sort_in_playback_order(self, tmp_path):
+        # The actual bug this guards against: ffmpeg-style extraction that
+        # doesn't zero-pad (out1.png, out2.png, ..., out3768.png) sorted
+        # lexicographically puts out10.png before out2.png, scrambling
+        # frame order fed into the quilting pipeline.
+        for name in ["out1.png", "out2.png", "out10.png", "out100.png", "out9.png", "out11.png"]:
+            (tmp_path / name).touch()
+
+        assert list_image_files(str(tmp_path)) == [
+            "out1.png", "out2.png", "out9.png", "out10.png", "out11.png", "out100.png",
+        ]
+
+    def test_zero_padded_filenames_still_sort_correctly(self, tmp_path):
+        for name in ["frame0010.png", "frame0002.png", "frame0001.png"]:
+            (tmp_path / name).touch()
+
+        assert list_image_files(str(tmp_path)) == ["frame0001.png", "frame0002.png", "frame0010.png"]
+
+    def test_non_image_files_are_filtered_out(self, tmp_path):
+        (tmp_path / "frame1.png").touch()
+        (tmp_path / "notes.txt").touch()
+        (tmp_path / "frame2.jpg").touch()
+
+        assert list_image_files(str(tmp_path)) == ["frame1.png", "frame2.jpg"]
+
+    def test_case_insensitive_extension_matching(self, tmp_path):
+        (tmp_path / "frame1.PNG").touch()
+        (tmp_path / "frame2.Jpg").touch()
+
+        assert set(list_image_files(str(tmp_path))) == {"frame1.PNG", "frame2.Jpg"}
 
 
 class TestComputeTileDescriptors:
