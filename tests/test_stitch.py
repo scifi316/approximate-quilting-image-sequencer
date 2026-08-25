@@ -1,3 +1,5 @@
+import os
+
 import cv2
 import faiss
 import numpy as np
@@ -358,3 +360,87 @@ class TestFallbackFrame:
 
     def test_returns_none_when_empty(self):
         assert stitch.fallbackFrame([]) is None
+
+
+class TestProcessTargetImagesParallel:
+    def test_parallel_output_matches_sequential_processing(self, tmp_path):
+        import build_database  # only needed by this test
+
+        mv_frames_dir = tmp_path / "mv_frames"
+        mv_frames_dir.mkdir()
+        for i in range(3):
+            cv2.imwrite(str(mv_frames_dir / f"frame{i:04d}.png"), _checkerboard(size=64, square=8 + i * 4))
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        build_database.buildDatabase(mv_frames_dir, output_dir=db_dir)
+
+        target_dir = tmp_path / "targets"
+        target_dir.mkdir()
+        for i in range(4):
+            cv2.imwrite(str(target_dir / f"target{i:04d}.png"), _checkerboard(size=64, square=8))
+
+        faiss_index_path = db_dir / "individual_descriptors_faiss_index.bin"
+        frame_ids_path = db_dir / "frame_ids.npy"
+        descriptor_indices_path = db_dir / "frame_to_descriptor_indices.npy"
+
+        # Both runs load the exact same on-disk index, so any index type is
+        # equally deterministic here -- what's under test is that dividing
+        # the frame list across worker processes doesn't change output.
+        sequential_out = tmp_path / "sequential_out"
+        sequential_out.mkdir()
+        faiss_index = stitch.faiss.read_index(str(faiss_index_path))
+        frame_ids = np.load(frame_ids_path)
+        mapping = np.load(descriptor_indices_path)
+        detector = cv2.SIFT_create()
+        for i, filename in enumerate(stitch.list_image_files(str(target_dir)), start=1):
+            stitch.processTargetImage(str(target_dir / filename), faiss_index, frame_ids, mapping,
+                                       str(mv_frames_dir), i, str(sequential_out),
+                                       chunk_width=16, chunk_height=16, detector=detector)
+
+        parallel_out = tmp_path / "parallel_out"
+        parallel_out.mkdir()
+        count = stitch.processTargetImagesParallel(
+            str(target_dir), faiss_index_path, frame_ids_path, descriptor_indices_path,
+            str(mv_frames_dir), str(parallel_out), chunk_width=16, chunk_height=16, num_workers=2
+        )
+
+        assert count == 4
+        sequential_files = sorted(os.listdir(sequential_out))
+        parallel_files = sorted(os.listdir(parallel_out))
+        assert sequential_files == parallel_files
+        for filename in sequential_files:
+            seq_img = cv2.imread(str(sequential_out / filename))
+            par_img = cv2.imread(str(parallel_out / filename))
+            np.testing.assert_array_equal(seq_img, par_img)
+
+    def test_progress_callback_is_invoked_once_per_frame(self, tmp_path):
+        import build_database  # only needed by this test
+
+        mv_frames_dir = tmp_path / "mv_frames"
+        mv_frames_dir.mkdir()
+        cv2.imwrite(str(mv_frames_dir / "frame0000.png"), _checkerboard())
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        build_database.buildDatabase(mv_frames_dir, output_dir=db_dir)
+
+        target_dir = tmp_path / "targets"
+        target_dir.mkdir()
+        for i in range(3):
+            cv2.imwrite(str(target_dir / f"target{i:04d}.png"), _checkerboard())
+
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        progress_calls = []
+        stitch.processTargetImagesParallel(
+            str(target_dir),
+            db_dir / "individual_descriptors_faiss_index.bin",
+            db_dir / "frame_ids.npy",
+            db_dir / "frame_to_descriptor_indices.npy",
+            str(mv_frames_dir), str(output_dir), chunk_width=16, chunk_height=16, num_workers=2,
+            on_progress=progress_calls.append,
+        )
+
+        assert sorted(progress_calls) == [1, 2, 3]
