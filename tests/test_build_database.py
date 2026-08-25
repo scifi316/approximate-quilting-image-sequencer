@@ -183,3 +183,76 @@ class TestGpuBuild:
         reloaded = build_database.faiss.read_index(str(index_path))
         assert reloaded.ntotal == faiss_index.ntotal
         assert reloaded.nprobe == build_database.IVF_NPROBE
+
+
+class TestTileDescriptorType:
+    """descriptor_type="tile" trades sparse SIFT keypoints for one dense
+    descriptor per grid tile -- every frame contributes exactly
+    (width/chunk_width) * (height/chunk_height) descriptors, regardless of
+    how much visual texture it has."""
+
+    def test_every_frame_contributes_exactly_one_descriptor_per_tile(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        # 64x64 images with chunk_width=chunk_height=16 -> 4x4 = 16 tiles/frame.
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_checkerboard())
+        cv2.imwrite(str(input_dir / "frame0001.png"), _make_checkerboard(square=16))
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir, descriptor_type="tile",
+            chunk_width=16, chunk_height=16, thumb_size=2,
+        )
+
+        assert list(frame_ids) == ["frame0000.png", "frame0001.png"]
+        assert faiss_index.ntotal == 32  # 2 frames * 16 tiles
+        assert faiss_index.d == build_database.tileDescriptorDim(2)
+        assert frame_to_descriptor_indices.count(0) == 16
+        assert frame_to_descriptor_indices.count(1) == 16
+
+    def test_blank_frame_still_contributes_descriptors_unlike_sift(self, tmp_path):
+        # This is the whole point of tile mode: a SIFT-featureless frame
+        # would be skipped entirely (see test_skipped_frames_do_not_desync_
+        # the_descriptor_to_frame_mapping above), silently dropping it from
+        # the database. Dense tiles never depend on detectable texture.
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_blank())
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir, descriptor_type="tile",
+            chunk_width=16, chunk_height=16, thumb_size=2,
+        )
+
+        assert list(frame_ids) == ["frame0000.png"]
+        assert faiss_index.ntotal == 16  # 4x4 tiles, even though the frame is blank
+
+    def test_chunk_size_not_dividing_the_frame_skips_it_without_crashing(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_checkerboard(size=64))  # 64 % 20 != 0
+        cv2.imwrite(str(input_dir / "frame0001.png"), _make_checkerboard(size=64, square=16))
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        _, frame_ids, _ = build_database.buildDatabase(
+            input_dir, output_dir=output_dir, descriptor_type="tile",
+            chunk_width=20, chunk_height=20, thumb_size=2,
+        )
+
+        # Both frames are the same non-dividing size, so both get skipped --
+        # the point is that buildDatabase keeps going rather than crashing.
+        assert frame_ids == []
+
+    def test_unknown_descriptor_type_raises(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+
+        with pytest.raises(ValueError):
+            build_database.buildDatabase(input_dir, output_dir=tmp_path, descriptor_type="not_a_real_type")

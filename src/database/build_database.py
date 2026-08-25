@@ -10,9 +10,24 @@ import faiss
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-from src.common import list_image_files  # noqa: E402
+from src.common import computeTileDescriptors, list_image_files, tileDescriptorDim  # noqa: E402
 
 DESCRIPTOR_DIM = 128  # SIFT descriptor dimensionality
+
+# "sift": sparse keypoint descriptors (the original approach). "tile": one
+# dense descriptor per grid tile (see src.common.computeTileDescriptors) --
+# needed for fine-grained quilting, since SIFT keypoints don't scale down
+# with tile size and leave most small tiles with nothing to match on. See
+# benchmarks/RESULTS.md for the keypoint-density numbers that motivated this.
+DESCRIPTOR_TYPES = ("sift", "tile")
+DEFAULT_DESCRIPTOR_TYPE = "sift"
+
+# Tile-descriptor defaults. 40 evenly divides both 1920 and 1080 (this
+# project's supported resolution) with no edge cropping, at roughly 4x the
+# tile count of the original 96x72 SIFT chunk size.
+DEFAULT_CHUNK_WIDTH = 40
+DEFAULT_CHUNK_HEIGHT = 40
+DEFAULT_THUMB_SIZE = 4
 
 # See benchmarks/faiss_index_benchmark.py and benchmarks/RESULTS.md for how
 # these were chosen. IVFFlat and IVFPQ need a representative sample of
@@ -74,9 +89,31 @@ def _createIndex(index_type, dim, num_descriptors=0):
     raise ValueError(f"Unknown Faiss index type {index_type!r}; choose from {INDEX_TYPES}.")
 
 
-def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYPE, use_gpu=False):
-    """Build a Faiss index of individual SIFT descriptors from the MV frames,
-    along with a mapping from each descriptor back to the frame it came from.
+def _extractDescriptors(frame, descriptor_type, sift, chunk_width, chunk_height, thumb_size):
+    """Returns a float32 descriptors array (possibly empty/None-equivalent)
+    for one frame, per the configured descriptor_type."""
+    if descriptor_type == "sift":
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, descriptors = sift.detectAndCompute(gray_frame, None)
+        return descriptors.astype('float32') if descriptors is not None else None
+
+    descriptors, _, _ = computeTileDescriptors(frame, chunk_width, chunk_height, thumb_size)
+    return descriptors
+
+
+def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYPE, use_gpu=False,
+                   descriptor_type=DEFAULT_DESCRIPTOR_TYPE, chunk_width=DEFAULT_CHUNK_WIDTH,
+                   chunk_height=DEFAULT_CHUNK_HEIGHT, thumb_size=DEFAULT_THUMB_SIZE):
+    """Build a Faiss index of per-frame descriptors from the MV frames, along
+    with a mapping from each descriptor back to the frame it came from.
+
+    descriptor_type="sift" (default) uses sparse SIFT keypoints, one entry
+    per detected keypoint. descriptor_type="tile" uses one dense descriptor
+    per chunk_width x chunk_height grid tile instead (see
+    src.common.computeTileDescriptors) -- required for fine-grained quilting
+    (small chunk sizes), since SIFT keypoint density doesn't scale down with
+    tile size. chunk_width/chunk_height/thumb_size are only used in "tile"
+    mode and must match what stitch.py's target-frame processing uses.
 
     For flat/hnsw (no training step), descriptors are added to the Faiss
     index incrementally, one frame at a time, instead of being accumulated
@@ -93,6 +130,8 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
     """
     if index_type not in INDEX_TYPES:
         raise ValueError(f"Unknown Faiss index type {index_type!r}; choose from {INDEX_TYPES}.")
+    if descriptor_type not in DESCRIPTOR_TYPES:
+        raise ValueError(f"Unknown descriptor type {descriptor_type!r}; choose from {DESCRIPTOR_TYPES}.")
 
     if use_gpu and index_type not in GPU_INDEX_TYPES:
         raise ValueError(
@@ -101,10 +140,11 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
     if use_gpu and faiss.get_num_gpus() == 0:
         raise RuntimeError("use_gpu=True was requested but Faiss reports no GPUs are available.")
 
+    descriptor_dim = DESCRIPTOR_DIM if descriptor_type == "sift" else tileDescriptorDim(thumb_size)
     needs_training = index_type in TRAINED_INDEX_TYPES
 
-    sift = cv2.SIFT_create()
-    faiss_index = None if needs_training else _createIndex(index_type, DESCRIPTOR_DIM)
+    sift = cv2.SIFT_create() if descriptor_type == "sift" else None
+    faiss_index = None if needs_training else _createIndex(index_type, descriptor_dim)
     pending_descriptors = [] if needs_training else None
 
     frame_ids = []
@@ -117,16 +157,19 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
             print(f"Skipping {filename}: could not read image.")
             continue
 
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, descriptors = sift.detectAndCompute(gray_frame, None)
+        try:
+            descriptors = _extractDescriptors(frame, descriptor_type, sift, chunk_width, chunk_height, thumb_size)
+        except ValueError as error:
+            print(f"Skipping {filename}: {error}")
+            continue
 
         if descriptors is None or len(descriptors) == 0:
             print(f"Skipping {filename}: no features detected.")
             continue
 
-        if descriptors.shape[1] != DESCRIPTOR_DIM:
+        if descriptors.shape[1] != descriptor_dim:
             print(f"Skipping {filename}: descriptor dimension {descriptors.shape[1]} "
-                  f"does not match expected dimension {DESCRIPTOR_DIM}.")
+                  f"does not match expected dimension {descriptor_dim}.")
             continue
 
         # Use the frame's about-to-be-assigned position in frame_ids as its
@@ -134,7 +177,6 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
         # otherwise the mapping desyncs from frame_ids as soon as any frame
         # is skipped above.
         frame_index = len(frame_ids)
-        descriptors = descriptors.astype('float32')
         if needs_training:
             pending_descriptors.append(descriptors)
         else:
@@ -145,9 +187,9 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
     if needs_training:
         all_descriptors = (
             np.vstack(pending_descriptors) if pending_descriptors
-            else np.empty((0, DESCRIPTOR_DIM), dtype='float32')
+            else np.empty((0, descriptor_dim), dtype='float32')
         )
-        faiss_index = _createIndex(index_type, DESCRIPTOR_DIM, num_descriptors=len(all_descriptors))
+        faiss_index = _createIndex(index_type, descriptor_dim, num_descriptors=len(all_descriptors))
         if len(all_descriptors) > 0:
             gpu_resources = None
             train_index = faiss_index
@@ -182,5 +224,12 @@ if __name__ == "__main__":
     mv_frames_folder = ROOT_DIR / 'data/images/input'
     index_type = os.environ.get('FAISS_INDEX_TYPE', DEFAULT_INDEX_TYPE)
     use_gpu = os.environ.get('FAISS_USE_GPU', '').lower() in ('1', 'true', 'yes')
-    buildDatabase(mv_frames_folder, output_dir=ROOT_DIR, index_type=index_type, use_gpu=use_gpu)
-    print(f"Faiss index ({index_type}{'+gpu' if use_gpu else ''}) created and saved successfully.")
+    descriptor_type = os.environ.get('QUILT_DESCRIPTOR_TYPE', DEFAULT_DESCRIPTOR_TYPE)
+    chunk_width = int(os.environ.get('QUILT_CHUNK_WIDTH', DEFAULT_CHUNK_WIDTH))
+    chunk_height = int(os.environ.get('QUILT_CHUNK_HEIGHT', DEFAULT_CHUNK_HEIGHT))
+    thumb_size = int(os.environ.get('QUILT_THUMB_SIZE', DEFAULT_THUMB_SIZE))
+    buildDatabase(mv_frames_folder, output_dir=ROOT_DIR, index_type=index_type, use_gpu=use_gpu,
+                  descriptor_type=descriptor_type, chunk_width=chunk_width, chunk_height=chunk_height,
+                  thumb_size=thumb_size)
+    print(f"Faiss index ({index_type}{'+gpu' if use_gpu else ''}, descriptor_type={descriptor_type}) "
+          f"created and saved successfully.")
