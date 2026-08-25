@@ -84,6 +84,55 @@ at this small scale (see the `recall@7` gap on `ivfpq` above, which needs a
 much larger training set to be meaningful) are not representative and
 shouldn't be used to pick a default.
 
+## Fine-grained quilting: dense tile descriptors vs. SIFT
+
+SIFT keypoint density doesn't scale down with chunk size. Measured on a
+real 1920x1080 target frame (2,781 total keypoints):
+
+| chunk size | chunks/frame | avg keypoints/chunk |
+|---|---:|---:|
+| 96x72 (original default) | 300 | 9.27 |
+| 32x32 | 2,040 | 1.36 |
+| 16x16 | 8,160 | 0.34 |
+| 8x8 | 32,400 | 0.09 |
+
+Below roughly 32px, most chunks get zero keypoints and fall back to
+black/default -- shrinking the chunk grid with SIFT doesn't add detail, it
+mostly produces a black image with occasional matched tiles. `descriptor_type
+="tile"` (`src.common.computeTileDescriptors`) fixes this by computing one
+dense descriptor per tile (a downsampled color/luminance thumbnail) instead
+of relying on detected keypoints -- every tile gets exactly one descriptor
+regardless of content.
+
+**End-to-end effect on the real dataset** (40x40 chunks, thumb_size=4,
+`ivfflat+gpu`-built database, 15 GPU workers, `benchmarks/RESULTS.md`'s
+persistent thumbnail cache): **27.18 FPS** on a 300-frame sample, vs. 2.53
+FPS for the original sequential SIFT baseline -- a ~10.7x speedup, on top of
+4.3x more tiles per frame (1,296 vs. 300). Per-frame cost breakdown (warm
+cache, single process): descriptor extraction 140ms -> 1.6ms (SIFT
+elimination via one vectorized `cv2.resize` call instead of 300+ individual
+`detectAndCompute` calls), quilting 124.6ms -> 5.0ms (vectorized assembly +
+cross-frame thumbnail cache instead of a per-chunk Python loop + per-frame
+disk re-reads), Faiss search 76.8ms -> 27.5ms (CPU -> GPU).
+
+**This is not a strict upgrade -- there's a real quality tradeoff.** A
+downsampled color/luminance thumbnail is far less discriminative than SIFT's
+structural matching. In practice this shows up as more *repetitive* tile
+content: visually distinct source frames with similar overall brightness
+collapse to similar matches, especially at small `thumb_size`. Raising
+`thumb_size` (e.g. 4 -> 8) noticeably improves match variety at some
+further cost -- it's a real dial to tune per source material, not a knob
+with one correct answer. See `docs/INSTALL.md` for the `QUILT_*` environment
+variables that configure it end to end.
+
+Also note: `IndexIVFFlat`'s `nprobe`-driven approximate search combined with
+this many more, smaller queries per frame means Faiss's default GPU scratch
+buffer (~1.5GB per `GpuResources` instance) becomes a real constraint once
+many worker processes each grab their own -- 15 workers x 1.5GB exhausted
+host memory in testing. `stitch._moveIndexToGpu` caps this at 128MB per
+worker (`GPU_TEMP_MEMORY_BYTES`), comfortably enough for this workload's
+small batches.
+
 ## Notes on running this yourself
 
 - Requires `individual_descriptors_faiss_index.bin` at the repo root
