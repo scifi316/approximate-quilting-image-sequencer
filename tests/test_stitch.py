@@ -354,6 +354,77 @@ class TestQuiltImage:
         assert len(read_calls) == 1
 
 
+class TestQuiltImageGrid:
+    def test_matches_quiltImage_output_on_a_regular_grid(self, tmp_path):
+        frame_a = np.full((4, 4, 3), 200, dtype=np.uint8)
+        frame_b = np.full((4, 4, 3), 50, dtype=np.uint8)
+        cv2.imwrite(str(tmp_path / "a.png"), frame_a)
+        cv2.imwrite(str(tmp_path / "b.png"), frame_b)
+
+        # 2x2 grid of 2x2 chunks, mixing two distinct matches, a repeat,
+        # and a None (no match).
+        chunk_results = [(0, 0, "a.png", 3), (2, 0, "b.png", 2), (0, 2, None, None), (2, 2, "a.png", 1)]
+
+        expected = stitch.quiltImage(chunk_results, str(tmp_path), (4, 4, 3), chunk_width=2, chunk_height=2)
+        actual = stitch.quiltImageGrid(chunk_results, str(tmp_path), (4, 4, 3), chunk_width=2, chunk_height=2)
+
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_missing_frame_file_fills_black_instead_of_crashing(self, tmp_path):
+        chunk_results = [(0, 0, "does_not_exist.png", 5)]
+
+        quilted = stitch.quiltImageGrid(chunk_results, str(tmp_path), (2, 2, 3), chunk_width=2, chunk_height=2)
+
+        np.testing.assert_array_equal(quilted, np.zeros((2, 2, 3), dtype=np.uint8))
+
+    def test_non_dividing_chunk_size_raises(self, tmp_path):
+        chunk_results = [(0, 0, None, None)]
+
+        with pytest.raises(ValueError):
+            stitch.quiltImageGrid(chunk_results, str(tmp_path), (5, 5, 3), chunk_width=2, chunk_height=2)
+
+    def test_repeated_matches_read_the_source_frame_from_disk_only_once(self, tmp_path, monkeypatch):
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        cv2.imwrite(str(tmp_path / "frame.png"), frame)
+
+        read_calls = []
+        original_imread = cv2.imread
+
+        def counting_imread(path, *args, **kwargs):
+            read_calls.append(path)
+            return original_imread(path, *args, **kwargs)
+
+        monkeypatch.setattr(cv2, "imread", counting_imread)
+
+        chunk_results = [(0, 0, "frame.png", 1), (2, 0, "frame.png", 1), (0, 2, "frame.png", 1), (2, 2, "frame.png", 1)]
+        stitch.quiltImageGrid(chunk_results, str(tmp_path), (4, 4, 3), chunk_width=2, chunk_height=2)
+
+        assert len(read_calls) == 1
+
+    def test_shared_thumbnail_cache_avoids_disk_reads_across_calls(self, tmp_path, monkeypatch):
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        cv2.imwrite(str(tmp_path / "frame.png"), frame)
+
+        read_calls = []
+        original_imread = cv2.imread
+
+        def counting_imread(path, *args, **kwargs):
+            read_calls.append(path)
+            return original_imread(path, *args, **kwargs)
+
+        monkeypatch.setattr(cv2, "imread", counting_imread)
+
+        shared_cache = {}
+        chunk_results = [(0, 0, "frame.png", 1)]
+        first = stitch.quiltImageGrid(chunk_results, str(tmp_path), (2, 2, 3), chunk_width=2, chunk_height=2,
+                                       thumbnail_cache=shared_cache)
+        second = stitch.quiltImageGrid(chunk_results, str(tmp_path), (2, 2, 3), chunk_width=2, chunk_height=2,
+                                        thumbnail_cache=shared_cache)
+
+        assert len(read_calls) == 1  # second call reused the cache, no re-read
+        np.testing.assert_array_equal(first, second)
+
+
 class TestFallbackFrame:
     def test_returns_first_frame_when_present(self):
         assert stitch.fallbackFrame(["a.png", "b.png"]) == "a.png"

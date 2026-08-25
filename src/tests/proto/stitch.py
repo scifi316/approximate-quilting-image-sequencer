@@ -210,6 +210,74 @@ def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width,
     return quilted_image
 
 
+def quiltImageGrid(chunk_results, mv_frames_folder, target_image_shape, chunk_width, chunk_height,
+                    thumbnail_cache=None):
+    """Vectorized equivalent of quiltImage for a regular, exact chunk grid
+    (target_image_shape's width/height evenly divisible by chunk_width/
+    chunk_height -- true for tile-descriptor mode by construction, since
+    computeTileDescriptors requires exact division; not for SIFT mode's
+    possible partial edge chunks, so use quiltImage there instead).
+
+    quiltImage's per-chunk Python loop becomes the dominant per-frame cost
+    once chunk counts get large (fine-grained quilting): the pixel-copy
+    work itself is trivial, but thousands of individual dict lookups and
+    numpy slice-assignments in a Python loop is not. This does the same
+    work as a handful of vectorized numpy operations instead: resize each
+    *unique* matched frame once, then gather + one reshape/transpose to
+    assemble the whole canvas in a single shot -- no per-chunk Python loop.
+
+    thumbnail_cache, if given, is a dict reused *across calls* (across
+    target frames), mapping frame_id -> its resized thumbnail. The source
+    database only has as many distinct frames as it was built from (~5K in
+    this project's dataset), and their resized thumbnails are tiny, so
+    caching across the whole run instead of re-reading+resizing a matched
+    frame from disk every time it's matched again (common: many chunks per
+    frame, across many frames, repeatedly match the same popular source
+    frames) turns most quilting into a pure in-memory gather.
+    """
+    h, w = target_image_shape[:2]
+    if w % chunk_width != 0 or h % chunk_height != 0:
+        raise ValueError(f"Target size {w}x{h} isn't evenly divisible by chunk size {chunk_width}x{chunk_height}.")
+    num_cols = w // chunk_width
+    num_rows = h // chunk_height
+
+    black_tile = np.zeros((chunk_height, chunk_width, 3), dtype=np.uint8)
+    resized_by_frame_id = {None: black_tile} if thumbnail_cache is None else thumbnail_cache
+    resized_by_frame_id.setdefault(None, black_tile)
+
+    def _resizedTile(match_frame_id):
+        if match_frame_id not in resized_by_frame_id:
+            mv_frame = cv2.imread(os.path.join(mv_frames_folder, match_frame_id))
+            if mv_frame is None:
+                print(f"Frame {os.path.join(mv_frames_folder, match_frame_id)} not found.")
+                resized_by_frame_id[match_frame_id] = black_tile
+            else:
+                resized_by_frame_id[match_frame_id] = cv2.resize(mv_frame, (chunk_width, chunk_height))
+        return resized_by_frame_id[match_frame_id]
+
+    match_frame_ids = [match_frame_id for _, _, match_frame_id, _ in chunk_results]
+    # Only this call's distinct matches -- resized_by_frame_id may be a
+    # cache shared across many calls and grow much larger than what's
+    # needed here; stacking the whole cache every call would make this
+    # scale with total frames seen so far instead of this frame's chunks.
+    unique_ids = list(dict.fromkeys(match_frame_ids))  # de-duplicate, preserve order
+    for match_frame_id in unique_ids:
+        _resizedTile(match_frame_id)  # populate resized_by_frame_id for every distinct match, once each
+
+    id_to_unique_index = {frame_id: index for index, frame_id in enumerate(unique_ids)}
+    stacked_tiles = np.stack([resized_by_frame_id[frame_id] for frame_id in unique_ids])  # (U, ch, cw, 3)
+
+    chunk_to_unique_index = np.array([id_to_unique_index[frame_id] for frame_id in match_frame_ids])
+    all_tiles = stacked_tiles[chunk_to_unique_index]  # (num_chunks, chunk_height, chunk_width, 3)
+
+    quilted_image = (
+        all_tiles.reshape(num_rows, num_cols, chunk_height, chunk_width, 3)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(h, w, 3)
+    )
+    return np.ascontiguousarray(quilted_image)
+
+
 def _descriptorsForChunks(target_image, image_chunks, chunk_width, chunk_height, descriptor_type,
                            detector, thumb_size):
     """Dispatch to the configured descriptor extraction strategy. Must
@@ -231,7 +299,7 @@ def _descriptorsForChunks(target_image, image_chunks, chunk_width, chunk_height,
 
 def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descriptor_indices,
                         mv_frames_folder, output_index, output_dir, chunk_width=96, chunk_height=72,
-                        detector=None, descriptor_type="sift", thumb_size=4):
+                        detector=None, descriptor_type="sift", thumb_size=4, thumbnail_cache=None):
     """Process a single target image against an already-loaded Faiss index.
 
     faiss_index/frame_ids/frame_to_descriptor_indices are loaded once by the
@@ -267,22 +335,42 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
         for (x, y, _), (match_frame_id, match_score) in zip(image_chunks, matches)
     ]
 
-    # Quilt the final image using the matched frames
-    quilted_image = quiltImage(chunk_results, mv_frames_folder, target_image.shape, chunk_width, chunk_height)
+    # Quilt the final image using the matched frames. Tile mode guarantees
+    # an exact chunk grid (computeTileDescriptors requires it), so it can
+    # use quiltImageGrid's vectorized assembly; SIFT mode may have partial
+    # edge chunks (image dims not evenly divisible by chunk size), which
+    # only the general per-chunk quiltImage handles.
+    if descriptor_type == "tile":
+        quilted_image = quiltImageGrid(chunk_results, mv_frames_folder, target_image.shape, chunk_width,
+                                        chunk_height, thumbnail_cache=thumbnail_cache)
+    else:
+        quilted_image = quiltImage(chunk_results, mv_frames_folder, target_image.shape, chunk_width, chunk_height)
 
     # Save the quilted image
     output_image_path = Path(output_dir) / f"quilted_frame{output_index:04d}.png"
     cv2.imwrite(str(output_image_path), quilted_image)
 
 
+GPU_TEMP_MEMORY_BYTES = 128 * 1024 * 1024  # 128MB
+
+
 def _moveIndexToGpu(faiss_index):
     """Move a CPU Faiss index onto the GPU for searching. Returns
     (gpu_index, gpu_resources); gpu_resources must be kept alive by the
     caller for as long as gpu_index is used -- freeing it invalidates the
-    index. Faiss's GPU backend doesn't support HNSW indexes."""
+    index. Faiss's GPU backend doesn't support HNSW indexes.
+
+    Caps each GpuResources' scratch buffer well below Faiss's ~1.5GB
+    default: this pipeline runs many worker processes that each grab their
+    own GpuResources sharing one GPU (see processTargetImagesParallel), and
+    15 workers x 1.5GB default temp memory alone can exhaust host memory
+    before the search workload -- small batches of 48-128D vectors -- ever
+    needs anywhere near that much scratch space.
+    """
     if isinstance(faiss_index, faiss.IndexHNSWFlat):
         raise ValueError("HNSW indexes aren't supported on Faiss's GPU backend; build with flat or ivfflat instead.")
     gpu_resources = faiss.StandardGpuResources()
+    gpu_resources.setTempMemory(GPU_TEMP_MEMORY_BYTES)
     gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, faiss_index)
     return gpu_index, gpu_resources
 
@@ -320,6 +408,13 @@ def _initWorker(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_fr
     _worker_state["descriptor_type"] = descriptor_type
     _worker_state["thumb_size"] = thumb_size
     _worker_state["detector"] = cv2.SIFT_create() if descriptor_type == "sift" else None
+    # Persists across every frame this worker processes (not per-frame): the
+    # source database only has as many distinct frames as it was built
+    # from, and their resized thumbnails are tiny, so this turns repeated
+    # matches to popular source frames into in-memory gathers instead of
+    # re-reading+resizing them from disk on every target frame that matches
+    # them. Only used by quiltImageGrid (descriptor_type="tile").
+    _worker_state["thumbnail_cache"] = {}
 
 
 def _processOneFrameInWorker(args):
@@ -337,6 +432,7 @@ def _processOneFrameInWorker(args):
         detector=_worker_state["detector"],
         descriptor_type=_worker_state["descriptor_type"],
         thumb_size=_worker_state["thumb_size"],
+        thumbnail_cache=_worker_state["thumbnail_cache"],
     )
     return output_index
 
