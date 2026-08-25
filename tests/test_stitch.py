@@ -596,6 +596,79 @@ class TestProcessTargetImageTileMode:
         np.testing.assert_array_equal(quilted, expected)
 
 
+class TestUpscaleTo:
+    def test_output_canvas_matches_the_upscaled_size_not_the_source_size(self, tmp_path):
+        import build_database
+
+        mv_frames_dir = tmp_path / "mv_frames"
+        mv_frames_dir.mkdir()
+        cv2.imwrite(str(mv_frames_dir / "frame0000.png"), _checkerboard(size=64, square=8))
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        build_database.buildDatabase(
+            mv_frames_dir, output_dir=db_dir, descriptor_type="tile",
+            chunk_width=4, chunk_height=4, thumb_size=2,
+        )
+
+        target_dir = tmp_path / "targets"
+        target_dir.mkdir()
+        # 8x8 source target, upscaled to 16x16 before chunking -- more 4x4
+        # tiles (16 instead of 4) covering the same original content.
+        cv2.imwrite(str(target_dir / "target0000.png"), np.full((8, 8, 3), 100, dtype=np.uint8))
+
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        faiss_index = stitch.faiss.read_index(str(db_dir / "individual_descriptors_faiss_index.bin"))
+        frame_ids = np.load(db_dir / "frame_ids.npy")
+        mapping = np.load(db_dir / "frame_to_descriptor_indices.npy")
+
+        stitch.processTargetImage(
+            str(target_dir / "target0000.png"), faiss_index, frame_ids, mapping,
+            str(mv_frames_dir), 1, str(output_dir),
+            chunk_width=4, chunk_height=4, descriptor_type="tile", thumb_size=2,
+            upscale_to=(16, 16),
+        )
+
+        quilted = cv2.imread(str(output_dir / "quilted_frame0001.png"))
+        assert quilted.shape == (16, 16, 3)
+
+    def test_none_leaves_target_image_at_its_original_size(self, tmp_path):
+        import build_database
+
+        mv_frames_dir = tmp_path / "mv_frames"
+        mv_frames_dir.mkdir()
+        cv2.imwrite(str(mv_frames_dir / "frame0000.png"), _checkerboard(size=64, square=8))
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        build_database.buildDatabase(
+            mv_frames_dir, output_dir=db_dir, descriptor_type="tile",
+            chunk_width=4, chunk_height=4, thumb_size=2,
+        )
+
+        target_dir = tmp_path / "targets"
+        target_dir.mkdir()
+        cv2.imwrite(str(target_dir / "target0000.png"), np.full((8, 8, 3), 100, dtype=np.uint8))
+
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        faiss_index = stitch.faiss.read_index(str(db_dir / "individual_descriptors_faiss_index.bin"))
+        frame_ids = np.load(db_dir / "frame_ids.npy")
+        mapping = np.load(db_dir / "frame_to_descriptor_indices.npy")
+
+        stitch.processTargetImage(
+            str(target_dir / "target0000.png"), faiss_index, frame_ids, mapping,
+            str(mv_frames_dir), 1, str(output_dir),
+            chunk_width=4, chunk_height=4, descriptor_type="tile", thumb_size=2,
+        )
+
+        quilted = cv2.imread(str(output_dir / "quilted_frame0001.png"))
+        assert quilted.shape == (8, 8, 3)
+
+
 class TestMoveIndexToGpu:
     def test_hnsw_index_is_rejected(self):
         index = faiss.IndexHNSWFlat(4, 8)

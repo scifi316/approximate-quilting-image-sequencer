@@ -299,7 +299,8 @@ def _descriptorsForChunks(target_image, image_chunks, chunk_width, chunk_height,
 
 def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descriptor_indices,
                         mv_frames_folder, output_index, output_dir, chunk_width=96, chunk_height=72,
-                        detector=None, descriptor_type="sift", thumb_size=4, thumbnail_cache=None):
+                        detector=None, descriptor_type="sift", thumb_size=4, thumbnail_cache=None,
+                        upscale_to=None):
     """Process a single target image against an already-loaded Faiss index.
 
     faiss_index/frame_ids/frame_to_descriptor_indices are loaded once by the
@@ -314,11 +315,24 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
     index different, incompatible vector spaces, and chunk_width/
     chunk_height/thumb_size must match what was used to build a "tile"
     database, since tile descriptors are tied to a specific grid alignment.
+
+    upscale_to, if given, is an (width, height) pair the target image is
+    resized to before chunking -- e.g. (3840, 2160) to chunk a 1920x1080
+    source at 4K. This doesn't add real detail (it's the same source
+    footage, just resampled larger), but it does pack more chunk_width x
+    chunk_height tiles into the same visual content, since each tile then
+    covers a proportionally smaller fraction of it -- a way to increase
+    mosaic granularity without shrinking the tile pixel size itself. Must
+    be evenly divisible by chunk_width/chunk_height for "tile" mode (see
+    computeTileDescriptors).
     """
     # Load the target image
     target_image = cv2.imread(str(target_image_path))
     if target_image is None:
         raise FileNotFoundError(f"Target image {target_image_path} not found.")
+
+    if upscale_to is not None:
+        target_image = cv2.resize(target_image, upscale_to, interpolation=cv2.INTER_CUBIC)
 
     # Split the target image into chunks
     image_chunks = splitImage(target_image, chunk_width, chunk_height)
@@ -379,7 +393,8 @@ _worker_state = {}
 
 
 def _initWorker(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder,
-                 chunk_width, chunk_height, threads_per_worker, descriptor_type, thumb_size, use_gpu):
+                 chunk_width, chunk_height, threads_per_worker, descriptor_type, thumb_size, use_gpu,
+                 upscale_to):
     """multiprocessing.Pool initializer: each worker loads its own copy of
     the Faiss index once (Faiss indexes aren't picklable/shareable across
     process boundaries) and caps its own thread pools -- otherwise every
@@ -407,6 +422,7 @@ def _initWorker(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_fr
     _worker_state["chunk_height"] = chunk_height
     _worker_state["descriptor_type"] = descriptor_type
     _worker_state["thumb_size"] = thumb_size
+    _worker_state["upscale_to"] = upscale_to
     _worker_state["detector"] = cv2.SIFT_create() if descriptor_type == "sift" else None
     # Persists across every frame this worker processes (not per-frame): the
     # source database only has as many distinct frames as it was built
@@ -433,6 +449,7 @@ def _processOneFrameInWorker(args):
         descriptor_type=_worker_state["descriptor_type"],
         thumb_size=_worker_state["thumb_size"],
         thumbnail_cache=_worker_state["thumbnail_cache"],
+        upscale_to=_worker_state["upscale_to"],
     )
     return output_index
 
@@ -440,7 +457,7 @@ def _processOneFrameInWorker(args):
 def processTargetImagesParallel(target_image_dir, faiss_index_path, frame_ids_path, descriptor_indices_path,
                                  mv_frames_folder, output_dir, chunk_width=96, chunk_height=72,
                                  num_workers=None, on_progress=None, descriptor_type="sift", thumb_size=4,
-                                 use_gpu=False):
+                                 use_gpu=False, upscale_to=None):
     """Process every target image in target_image_dir across multiple
     worker processes instead of one frame at a time in the calling process.
 
@@ -454,7 +471,9 @@ def processTargetImagesParallel(target_image_dir, faiss_index_path, frame_ids_pa
     descriptor_type/chunk_width/chunk_height/thumb_size must match how the
     database at faiss_index_path was built (build_database.buildDatabase).
     use_gpu moves each worker's own Faiss index copy onto the GPU for
-    searching (not supported for HNSW-built indexes).
+    searching (not supported for HNSW-built indexes). upscale_to is an
+    (width, height) pair each target frame is resized to before chunking --
+    see processTargetImage's docstring.
     """
     os.makedirs(output_dir, exist_ok=True)
     num_workers = max(1, num_workers or (multiprocessing.cpu_count() - 1))
@@ -473,7 +492,8 @@ def processTargetImagesParallel(target_image_dir, faiss_index_path, frame_ids_pa
         processes=num_workers,
         initializer=_initWorker,
         initargs=(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder,
-                  chunk_width, chunk_height, threads_per_worker, descriptor_type, thumb_size, use_gpu),
+                  chunk_width, chunk_height, threads_per_worker, descriptor_type, thumb_size, use_gpu,
+                  upscale_to),
     ) as pool:
         for completed, _ in enumerate(pool.imap_unordered(_processOneFrameInWorker, tasks), start=1):
             if on_progress:
@@ -506,6 +526,14 @@ if __name__ == "__main__":
     chunk_height = int(os.environ.get('QUILT_CHUNK_HEIGHT', 72))
     thumb_size = int(os.environ.get('QUILT_THUMB_SIZE', 4))
     use_gpu = os.environ.get('QUILT_USE_GPU', '').lower() in ('1', 'true', 'yes')
+    # Resize each target frame to QUILT_UPSCALE_WIDTHxQUILT_UPSCALE_HEIGHT
+    # before chunking -- e.g. 3840x2160 to chunk a 1080p source at 4K,
+    # packing more chunk_width x chunk_height tiles into the same footage
+    # without shrinking the tile pixel size. See processTargetImage's
+    # upscale_to docstring. Both must be set together.
+    upscale_width = os.environ.get('QUILT_UPSCALE_WIDTH')
+    upscale_height = os.environ.get('QUILT_UPSCALE_HEIGHT')
+    upscale_to = (int(upscale_width), int(upscale_height)) if upscale_width and upscale_height else None
     total_frames = len(list_image_files(target_image_path))
 
     def _report_progress(completed):
@@ -515,6 +543,7 @@ if __name__ == "__main__":
     processTargetImagesParallel(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path,
                                  mv_frames_folder, output_dir, chunk_width=chunk_width, chunk_height=chunk_height,
                                  num_workers=num_workers, on_progress=_report_progress,
-                                 descriptor_type=descriptor_type, thumb_size=thumb_size, use_gpu=use_gpu)
+                                 descriptor_type=descriptor_type, thumb_size=thumb_size, use_gpu=use_gpu,
+                                 upscale_to=upscale_to)
 
     print("Quilted all images")
