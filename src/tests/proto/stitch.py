@@ -61,9 +61,14 @@ def _votesFromIndices(indices, frame_ids, frame_to_descriptor_indices):
     votes = []
     for row in indices:
         for descriptor_index in row:
-            if descriptor_index >= len(frame_to_descriptor_indices):
-                print(f"Error: descriptor_index {descriptor_index} is out of bounds for "
-                      f"frame_to_descriptor_indices of length {len(frame_to_descriptor_indices)}.")
+            # Faiss returns -1 for unfilled neighbor slots when a search finds
+            # fewer than top_k candidates (routine with approximate indexes
+            # such as IVF/HNSW). Without this check, -1 would silently wrap
+            # around to frame_to_descriptor_indices[-1] via Python indexing.
+            if descriptor_index < 0 or descriptor_index >= len(frame_to_descriptor_indices):
+                if descriptor_index >= len(frame_to_descriptor_indices):
+                    print(f"Error: descriptor_index {descriptor_index} is out of bounds for "
+                          f"frame_to_descriptor_indices of length {len(frame_to_descriptor_indices)}.")
                 continue
 
             frame_index = frame_to_descriptor_indices[descriptor_index]
@@ -180,14 +185,16 @@ def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width,
     return quilted_image
 
 
-def processTargetImage(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path,
+def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descriptor_indices,
                         mv_frames_folder, output_index, output_dir, chunk_width=96, chunk_height=72,
                         detector=None):
-    # Load the Faiss index, frame IDs, and descriptor-to-frame mapping
-    faiss_index = faiss.read_index(str(faiss_index_path))
-    frame_ids = np.load(frame_ids_path)
-    frame_to_descriptor_indices = np.load(descriptor_indices_path)
+    """Process a single target image against an already-loaded Faiss index.
 
+    faiss_index/frame_ids/frame_to_descriptor_indices are loaded once by the
+    caller and reused across every target frame -- re-reading a
+    multi-hundred-MB index file per frame made processing a whole video
+    prohibitively slow.
+    """
     # Load the target image
     target_image = cv2.imread(str(target_image_path))
     if target_image is None:
@@ -223,10 +230,18 @@ if __name__ == "__main__":
     descriptor_indices_path = root_dir / 'frame_to_descriptor_indices.npy'
     output_dir = root_dir / 'data/images/quilted_output'
 
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load the Faiss index, frame IDs, and descriptor-to-frame mapping once
+    # and reuse them across every target frame.
+    faiss_index = faiss.read_index(str(faiss_index_path))
+    frame_ids = np.load(frame_ids_path)
+    frame_to_descriptor_indices = np.load(descriptor_indices_path)
+
     shared_detector = cv2.SIFT_create()
     for output_index, filename in enumerate(list_image_files(target_image_path), start=1):
         target_image = os.path.join(target_image_path, filename)
-        processTargetImage(target_image, faiss_index_path, frame_ids_path, descriptor_indices_path,
+        processTargetImage(target_image, faiss_index, frame_ids, frame_to_descriptor_indices,
                             mv_frames_folder, output_index, output_dir, detector=shared_detector)
 
     print("Quilted all images")
