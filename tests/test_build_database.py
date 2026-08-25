@@ -139,3 +139,47 @@ class TestIndexTypes:
         assert frame_ids == []
         assert frame_to_descriptor_indices == []
         assert faiss_index.ntotal == 0
+
+
+class TestGpuBuild:
+    def test_use_gpu_with_unsupported_index_type_raises(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+
+        with pytest.raises(ValueError):
+            build_database.buildDatabase(input_dir, output_dir=tmp_path, index_type="hnsw", use_gpu=True)
+
+    def test_use_gpu_without_a_gpu_raises(self, tmp_path, monkeypatch):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        monkeypatch.setattr(build_database.faiss, "get_num_gpus", lambda: 0)
+
+        with pytest.raises(RuntimeError):
+            build_database.buildDatabase(input_dir, output_dir=tmp_path, index_type="ivfflat", use_gpu=True)
+
+    @pytest.mark.skipif(build_database.faiss.get_num_gpus() == 0, reason="requires a Faiss-visible GPU")
+    def test_use_gpu_produces_a_cpu_loadable_index_with_a_consistent_mapping(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_checkerboard())
+        cv2.imwrite(str(input_dir / "frame0001.png"), _make_checkerboard(square=16))
+        cv2.imwrite(str(input_dir / "frame0002.png"), _make_checkerboard(size=96))
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir, index_type="ivfflat", use_gpu=True
+        )
+
+        assert list(frame_ids) == ["frame0000.png", "frame0001.png", "frame0002.png"]
+        assert faiss_index.ntotal == len(frame_to_descriptor_indices)
+        assert faiss_index.nprobe == build_database.IVF_NPROBE
+        # Not a faiss.GpuIndex -- must be loadable/queryable without a GPU.
+        assert isinstance(faiss_index, build_database.faiss.IndexIVFFlat)
+
+        # write_index/read_index must also round-trip a plain CPU index.
+        index_path = output_dir / "individual_descriptors_faiss_index.bin"
+        reloaded = build_database.faiss.read_index(str(index_path))
+        assert reloaded.ntotal == faiss_index.ntotal
+        assert reloaded.nprobe == build_database.IVF_NPROBE

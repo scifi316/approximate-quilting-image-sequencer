@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import faiss
 from pathlib import Path
+import multiprocessing
 import os
 import sys
 from collections import Counter
@@ -26,20 +27,44 @@ def splitImage(image, chunk_width, chunk_height):
     return chunks
 
 
-def detectFeatures(image_chunk, detector=None):
-    """Detect SIFT features in an image chunk.
+def detectFeaturesForChunks(image, chunks, chunk_width, chunk_height, detector=None):
+    """Detect SIFT features once for the whole target image, then bucket
+    each keypoint/descriptor into the chunk it falls in by pixel location.
 
     SIFT is used (rather than ORB) because the database built by
     build_database.py is indexed on 128-D SIFT descriptors; matching with a
     different descriptor type/dimensionality produces meaningless results.
-    Pass a shared `detector` to avoid the overhead of constructing a new
-    cv2.SIFT instance for every chunk.
+
+    Running detectAndCompute once per frame instead of once per chunk (there
+    are hundreds of chunks per frame) matters: SIFT pays fixed per-call
+    overhead (building a scale-space pyramid, etc.) on every call regardless
+    of how small the input is, so calling it per-chunk was the dominant cost
+    of processing a frame -- roughly 2/3 of total per-frame time, well above
+    the batched Faiss search itself. Pass a shared `detector` to also avoid
+    the overhead of constructing a new cv2.SIFT instance per frame.
+
+    Returns a list of descriptor arrays (or None where no keypoints fell in
+    that chunk), aligned with `chunks` (as produced by splitImage).
     """
     detector = detector or cv2.SIFT_create()
-    gray_chunk = cv2.cvtColor(image_chunk, cv2.COLOR_BGR2GRAY)
-    _, descriptors = detector.detectAndCompute(gray_chunk, None)
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keypoints, descriptors = detector.detectAndCompute(gray_image, None)
 
-    return descriptors
+    buckets = [[] for _ in chunks]
+    if not keypoints:
+        return [None] * len(chunks)
+
+    h, w = image.shape[:2]
+    num_cols = -(-w // chunk_width)  # ceil division, matches splitImage's chunk grid
+    num_rows = -(-h // chunk_height)
+
+    for keypoint, descriptor in zip(keypoints, descriptors):
+        x, y = keypoint.pt
+        col = min(max(int(x) // chunk_width, 0), num_cols - 1)
+        row = min(max(int(y) // chunk_height, 0), num_rows - 1)
+        buckets[row * num_cols + col].append(descriptor)
+
+    return [np.array(bucket, dtype='float32') if bucket else None for bucket in buckets]
 
 
 def _padOrValidateDescriptors(descriptors, faiss_index):
@@ -204,8 +229,9 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
     image_chunks = splitImage(target_image, chunk_width, chunk_height)
     detector = detector or cv2.SIFT_create()
 
-    # Detect features per chunk, then match all chunks in a single batched Faiss search
-    chunk_descriptors = [detectFeatures(chunk_data, detector) for _, _, chunk_data in image_chunks]
+    # Detect features once for the whole frame, bucket them per chunk, then
+    # match all chunks in a single batched Faiss search
+    chunk_descriptors = detectFeaturesForChunks(target_image, image_chunks, chunk_width, chunk_height, detector)
     matches = matchFeaturesBatch(chunk_descriptors, faiss_index, frame_ids, frame_to_descriptor_indices)
 
     chunk_results = [
@@ -221,6 +247,86 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
     cv2.imwrite(str(output_image_path), quilted_image)
 
 
+_worker_state = {}
+
+
+def _initWorker(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder,
+                 chunk_width, chunk_height, threads_per_worker):
+    """multiprocessing.Pool initializer: each worker loads its own copy of
+    the Faiss index once (Faiss indexes aren't picklable/shareable across
+    process boundaries) and caps its own thread pools -- otherwise every
+    worker process would try to claim all available cores for its own
+    Faiss search and SIFT calls, oversubscribing the machine instead of
+    dividing it up across workers."""
+    faiss.omp_set_num_threads(threads_per_worker)
+    cv2.setNumThreads(1)
+
+    _worker_state["faiss_index"] = faiss.read_index(str(faiss_index_path))
+    _worker_state["frame_ids"] = np.load(frame_ids_path)
+    _worker_state["frame_to_descriptor_indices"] = np.load(descriptor_indices_path)
+    _worker_state["mv_frames_folder"] = mv_frames_folder
+    _worker_state["chunk_width"] = chunk_width
+    _worker_state["chunk_height"] = chunk_height
+    _worker_state["detector"] = cv2.SIFT_create()
+
+
+def _processOneFrameInWorker(args):
+    target_image_path, output_index, output_dir = args
+    processTargetImage(
+        target_image_path,
+        _worker_state["faiss_index"],
+        _worker_state["frame_ids"],
+        _worker_state["frame_to_descriptor_indices"],
+        _worker_state["mv_frames_folder"],
+        output_index,
+        output_dir,
+        chunk_width=_worker_state["chunk_width"],
+        chunk_height=_worker_state["chunk_height"],
+        detector=_worker_state["detector"],
+    )
+    return output_index
+
+
+def processTargetImagesParallel(target_image_dir, faiss_index_path, frame_ids_path, descriptor_indices_path,
+                                 mv_frames_folder, output_dir, chunk_width=96, chunk_height=72,
+                                 num_workers=None, on_progress=None):
+    """Process every target image in target_image_dir across multiple
+    worker processes instead of one frame at a time in the calling process.
+
+    Frames are independent -- each reads its own target image and writes
+    its own output file -- and per-frame cost is dominated by single-
+    threaded SIFT feature detection (see detectFeaturesForChunks), so this
+    scales with available cores in a way no further per-frame optimization
+    can. num_workers defaults to cpu_count() - 1. on_progress, if given, is
+    called with the number of frames completed so far after each one
+    finishes (order not guaranteed to match frame order).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    num_workers = max(1, num_workers or (multiprocessing.cpu_count() - 1))
+    # Leave each worker a small thread budget of its own for Faiss's
+    # OMP-parallel search, rather than pinning every worker to a single
+    # thread and fully serializing that part of the work.
+    threads_per_worker = max(1, multiprocessing.cpu_count() // num_workers)
+
+    filenames = list_image_files(target_image_dir)
+    tasks = [
+        (os.path.join(target_image_dir, filename), output_index, output_dir)
+        for output_index, filename in enumerate(filenames, start=1)
+    ]
+
+    with multiprocessing.Pool(
+        processes=num_workers,
+        initializer=_initWorker,
+        initargs=(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder,
+                  chunk_width, chunk_height, threads_per_worker),
+    ) as pool:
+        for completed, _ in enumerate(pool.imap_unordered(_processOneFrameInWorker, tasks), start=1):
+            if on_progress:
+                on_progress(completed)
+
+    return len(tasks)
+
+
 if __name__ == "__main__":
     # Define the paths to the target image, Faiss index, frame IDs, and MV frames
     target_image_path = root_dir / 'data/images/source'
@@ -230,18 +336,20 @@ if __name__ == "__main__":
     descriptor_indices_path = root_dir / 'frame_to_descriptor_indices.npy'
     output_dir = root_dir / 'data/images/quilted_output'
 
-    os.makedirs(output_dir, exist_ok=True)
+    # Frames are independent (each reads its own target image, writes its
+    # own output file), and per-frame cost is dominated by single-threaded
+    # SIFT detection, so this parallelizes across processes rather than
+    # processing one frame at a time. Override worker count with
+    # QUILT_WORKERS=N; QUILT_WORKERS=1 falls back to effectively sequential.
+    num_workers = int(os.environ.get('QUILT_WORKERS', 0)) or None
+    total_frames = len(list_image_files(target_image_path))
 
-    # Load the Faiss index, frame IDs, and descriptor-to-frame mapping once
-    # and reuse them across every target frame.
-    faiss_index = faiss.read_index(str(faiss_index_path))
-    frame_ids = np.load(frame_ids_path)
-    frame_to_descriptor_indices = np.load(descriptor_indices_path)
+    def _report_progress(completed):
+        if completed % 100 == 0 or completed == total_frames:
+            print(f"  {completed}/{total_frames} frames quilted")
 
-    shared_detector = cv2.SIFT_create()
-    for output_index, filename in enumerate(list_image_files(target_image_path), start=1):
-        target_image = os.path.join(target_image_path, filename)
-        processTargetImage(target_image, faiss_index, frame_ids, frame_to_descriptor_indices,
-                            mv_frames_folder, output_index, output_dir, detector=shared_detector)
+    processTargetImagesParallel(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path,
+                                 mv_frames_folder, output_dir, num_workers=num_workers,
+                                 on_progress=_report_progress)
 
     print("Quilted all images")

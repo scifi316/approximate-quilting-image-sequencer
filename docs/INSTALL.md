@@ -74,6 +74,16 @@ environment variable to try a different index type (`flat`, `hnsw`,
 FAISS_INDEX_TYPE=ivfflat python src/database/build_database.py
 ```
 
+If you have a CUDA GPU set up per `requirements.yml`, `ivfflat` can also be
+trained on the GPU with `FAISS_USE_GPU=1` -- this only speeds up the one-time
+build step (~1.7s vs ~446s on this project's dataset); the resulting index is
+converted back to a plain CPU index before being written, so no GPU is
+required later to load or query it:
+
+```
+FAISS_INDEX_TYPE=ivfflat FAISS_USE_GPU=1 python src/database/build_database.py
+```
+
 See `benchmarks/RESULTS.md` for build time / size / query latency / recall
 numbers for each type on this project's dataset, and how they were measured.
 
@@ -87,9 +97,15 @@ Where `"video_name.mp4"` is the name of the video you want to use in MP4 format,
 
 Depending on the specs of your PC and the video you use, this may take a moment for FFMPEG to parse and split the video into the correct amount of frames. 
 
-__NOTE:__ Currently this program only supports frame generation with video resolutions of 1920x1080, this program is also very slow and only does 2-3 FPS, so longer videos and/or videos with higher framerates will take longer time.
+__NOTE:__ Currently this program only supports frame generation with video resolutions of 1920x1080.
 
 _Now_ we should be able to create some new frames, locate the file `stitch.py` in the directory `/src/tests/proto/`, if everything has been done correctly, running `stitch.py` through the CLI/Terminal should start generating new frames in the folder `quilted_output`. It will prompt you with the message `"Quilted all images"` when finished.
+
+Frames are processed across multiple worker processes in parallel (each
+target frame is independent), defaulting to `cpu_count() - 1` workers. Set
+`QUILT_WORKERS=N` to override, e.g. `QUILT_WORKERS=1` to process frames one
+at a time. Per-frame work is dominated by single-threaded SIFT feature
+detection, so this scales close to linearly with available CPU cores.
 
 To rebuild the frames back into a video, navigate to the `"quilted_output"` directory and open a terminal instance, there we run:
 
