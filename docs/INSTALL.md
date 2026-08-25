@@ -157,6 +157,26 @@ dimension." Also set `QUILT_USE_GPU=1` to run the per-frame Faiss search on
 GPU (requires a `flat`- or `ivfflat`-built database; not supported for
 `hnsw`).
 
+#### More granular quilting without changing tile size: `QUILT_UPSCALE_WIDTH`/`QUILT_UPSCALE_HEIGHT`
+
+Set both to resize each target frame up before chunking, e.g. to chunk a
+1080p source at 4K:
+
+```
+QUILT_UPSCALE_WIDTH=3840 QUILT_UPSCALE_HEIGHT=2160 QUILT_DESCRIPTOR_TYPE=tile \
+QUILT_CHUNK_WIDTH=40 QUILT_CHUNK_HEIGHT=40 QUILT_THUMB_SIZE=8 QUILT_USE_GPU=1 \
+python src/tests/proto/stitch.py
+```
+
+This doesn't add real detail -- it's the same source footage, just
+resampled larger -- but it does pack more `QUILT_CHUNK_WIDTH` x
+`QUILT_CHUNK_HEIGHT` tiles into the same visual content (2x linear upscale
+= 4x more tiles), since each tile then covers a proportionally smaller
+fraction of it. A way to increase mosaic granularity without shrinking the
+tile pixel size itself. For `tile` mode, the upscaled resolution must still
+be evenly divisible by the chunk size (3840/40 and 2160/40 both divide
+evenly, so this combination works).
+
 To rebuild the frames back into a video, navigate to the `"quilted_output"` directory and open a terminal instance, there we run:
 
 $ ```ffmpeg -framerate [FPS of video] -i quilted_frame%04d.png -c:v libx264 -pix_fmt yuv420p out.mp4```
