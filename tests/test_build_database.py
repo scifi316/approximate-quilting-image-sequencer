@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import pytest
 
 import build_database
 
@@ -79,6 +80,60 @@ class TestBuildDatabase:
 
         faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
             input_dir, output_dir=output_dir
+        )
+
+        assert frame_ids == []
+        assert frame_to_descriptor_indices == []
+        assert faiss_index.ntotal == 0
+
+    def test_unknown_index_type_raises(self, tmp_path):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+
+        with pytest.raises(ValueError):
+            build_database.buildDatabase(input_dir, output_dir=tmp_path, index_type="not_a_real_index_type")
+
+
+class TestIndexTypes:
+    """Both the incrementally-filled types (flat, hnsw) and the
+    trained-then-bulk-filled types (ivfflat, ivfpq) must end up with the
+    same descriptor-to-frame mapping guarantees."""
+
+    @pytest.mark.parametrize("index_type", build_database.INDEX_TYPES)
+    def test_every_index_type_produces_a_consistent_mapping(self, tmp_path, index_type):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        cv2.imwrite(str(input_dir / "frame0000.png"), _make_checkerboard())
+        cv2.imwrite(str(input_dir / "frame0001.png"), _make_checkerboard(square=16))
+        cv2.imwrite(str(input_dir / "frame0002.png"), _make_checkerboard(size=96))
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir, index_type=index_type
+        )
+
+        assert list(frame_ids) == ["frame0000.png", "frame0001.png", "frame0002.png"]
+        assert faiss_index.ntotal == len(frame_to_descriptor_indices)
+        assert faiss_index.d == build_database.DESCRIPTOR_DIM
+        assert all(0 <= idx < len(frame_ids) for idx in frame_to_descriptor_indices)
+        assert set(frame_to_descriptor_indices) == {0, 1, 2}
+
+        if hasattr(faiss_index, "nprobe"):
+            # IVF indexes default to nprobe=1 (one inverted-list cell per
+            # query), which silently tanks recall unless raised explicitly.
+            assert faiss_index.nprobe == build_database.IVF_NPROBE
+
+    @pytest.mark.parametrize("index_type", build_database.TRAINED_INDEX_TYPES)
+    def test_trained_index_types_handle_an_empty_folder_without_crashing(self, tmp_path, index_type):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        faiss_index, frame_ids, frame_to_descriptor_indices = build_database.buildDatabase(
+            input_dir, output_dir=output_dir, index_type=index_type
         )
 
         assert frame_ids == []

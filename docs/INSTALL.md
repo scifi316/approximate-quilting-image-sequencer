@@ -64,6 +64,19 @@ __NOTE:__ Make sure you use the "activated" terminal to run the python files as 
 
 Any changes made to the input database located in `/data/images/input` requires a rebuild of the database binaries and headings. To accomplish such, from the repository root run `python src/database/build_database.py`, this will take some time but should generate the new binaries/headings directly in the repository root.
 
+By default this builds an `hnsw` Faiss index -- an approximate index that's
+orders of magnitude faster to query than the old exact brute-force search,
+with no GPU or training step required. Set the `FAISS_INDEX_TYPE`
+environment variable to try a different index type (`flat`, `hnsw`,
+`ivfflat`, `ivfpq`), e.g.:
+
+```
+FAISS_INDEX_TYPE=ivfflat python src/database/build_database.py
+```
+
+See `benchmarks/RESULTS.md` for build time / size / query latency / recall
+numbers for each type on this project's dataset, and how they were measured.
+
 To generate a video, make sure [FFMPEG](https://www.ffmpeg.org/download.html) is already installed on your system. This program works by sequentially generating each frame from a source video using the database of images given. 
 
 This requires take your video source and splitting them into individual frames for processing. The simplest way is by opening a terminal in the `.../source` directory you should have already created. There copy your video to that directory, `"video_name.mp4"` and run the following FFMPEG command:
