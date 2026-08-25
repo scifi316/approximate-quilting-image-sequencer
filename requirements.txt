@@ -1,3 +1,7 @@
+# faiss-gpu isn't published for recent Python/CUDA versions on PyPI; GPU
+# users should install via requirements.yml (conda) instead. faiss-cpu here
+# is enough to run the pipeline (without GPU search) from a pip-only install.
+faiss-cpu==1.8.0
 ffmpeg-python==0.2.0
 filelock==3.16.1
 fsspec==2024.9.0
