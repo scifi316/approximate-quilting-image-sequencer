@@ -58,6 +58,7 @@ def buildDatabase(mv_frames_folder, output_dir="."):
         frame_ids.append(filename)
 
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     faiss.write_index(faiss_index, str(output_dir / 'individual_descriptors_faiss_index.bin'))
     np.save(output_dir / 'frame_ids.npy', np.array(frame_ids))
     np.save(output_dir / 'frame_to_descriptor_indices.npy', np.array(frame_to_descriptor_indices))

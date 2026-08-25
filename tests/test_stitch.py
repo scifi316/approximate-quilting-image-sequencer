@@ -134,6 +134,21 @@ class TestMatchFeatures:
         assert frame == "only_frame.png"
         assert votes == 0
 
+    def test_search_returning_fewer_than_top_k_falls_back_instead_of_wrapping(self, small_index):
+        # Faiss fills unfilled neighbor slots with -1 when a search finds
+        # fewer than top_k candidates. Python indexing would silently
+        # resolve mapping[-1] to the *last* entry instead of treating it as
+        # invalid, so this must be handled explicitly rather than only
+        # bounds-checking the upper end.
+        index, frame_ids, mapping, vectors = small_index
+        descriptors = vectors[0:1]
+        top_k = len(vectors) + 5  # guarantees -1 padding in the result
+
+        frame, votes = stitch.matchFeatures(descriptors, index, frame_ids, mapping, top_k=top_k)
+
+        assert frame == "frame_a.png"
+        assert votes == 2  # both frame_a descriptors are the nearest real neighbors
+
 
 class TestMatchFeaturesBatch:
     def test_matches_each_chunk_independently_in_one_search_call(self, small_index, monkeypatch):
