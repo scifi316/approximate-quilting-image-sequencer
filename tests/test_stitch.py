@@ -686,3 +686,28 @@ class TestMoveIndexToGpu:
             np.testing.assert_array_equal(cpu_indices, gpu_indices)
         finally:
             del gpu_index, gpu_resources
+
+    @pytest.mark.skipif(faiss.get_num_gpus() == 0, reason="requires a Faiss-visible GPU")
+    def test_caps_both_temp_and_pinned_memory(self, small_index, monkeypatch):
+        # Regression test: Faiss's default ~256MB *pinned* buffer (separate
+        # from temp memory, and not covered by setTempMemory) caused
+        # intermittent cudaHostAlloc failures under many concurrent worker
+        # processes each requesting the default size at pool startup.
+        cpu_index, _, _, _ = small_index
+        calls = {}
+
+        class _RecordingResources(faiss.StandardGpuResources):
+            def setTempMemory(self, n):
+                calls["temp"] = n
+                return super().setTempMemory(n)
+
+            def setPinnedMemory(self, n):
+                calls["pinned"] = n
+                return super().setPinnedMemory(n)
+
+        monkeypatch.setattr(faiss, "StandardGpuResources", _RecordingResources)
+        gpu_index, gpu_resources = stitch._moveIndexToGpu(cpu_index)
+        try:
+            assert calls == {"temp": stitch.GPU_TEMP_MEMORY_BYTES, "pinned": stitch.GPU_PINNED_MEMORY_BYTES}
+        finally:
+            del gpu_index, gpu_resources

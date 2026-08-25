@@ -366,6 +366,7 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
 
 
 GPU_TEMP_MEMORY_BYTES = 128 * 1024 * 1024  # 128MB
+GPU_PINNED_MEMORY_BYTES = 32 * 1024 * 1024  # 32MB
 
 
 def _moveIndexToGpu(faiss_index):
@@ -375,16 +376,22 @@ def _moveIndexToGpu(faiss_index):
     index. Faiss's GPU backend doesn't support HNSW indexes.
 
     Caps each GpuResources' scratch buffer well below Faiss's ~1.5GB
-    default: this pipeline runs many worker processes that each grab their
-    own GpuResources sharing one GPU (see processTargetImagesParallel), and
-    15 workers x 1.5GB default temp memory alone can exhaust host memory
-    before the search workload -- small batches of 48-128D vectors -- ever
-    needs anywhere near that much scratch space.
+    default temp memory, and its separate ~256MB default pinned
+    CPU<->GPU async copy buffer: this pipeline runs many worker processes
+    that each grab their own GpuResources sharing one GPU (see
+    processTargetImagesParallel). Many workers each requesting the default
+    256MB *pinned* (page-locked) allocation concurrently at pool startup
+    intermittently failed with cudaHostAlloc errors ("resource already
+    mapped" / device busy) under real contention -- pinned memory is a
+    scarcer, more contended OS resource than regular heap, and this
+    workload's search batches (a few MB at most) don't need anywhere near
+    the default sizes.
     """
     if isinstance(faiss_index, faiss.IndexHNSWFlat):
         raise ValueError("HNSW indexes aren't supported on Faiss's GPU backend; build with flat or ivfflat instead.")
     gpu_resources = faiss.StandardGpuResources()
     gpu_resources.setTempMemory(GPU_TEMP_MEMORY_BYTES)
+    gpu_resources.setPinnedMemory(GPU_PINNED_MEMORY_BYTES)
     gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, faiss_index)
     return gpu_index, gpu_resources
 
