@@ -74,6 +74,16 @@ environment variable to try a different index type (`flat`, `hnsw`,
 FAISS_INDEX_TYPE=ivfflat python src/database/build_database.py
 ```
 
+If you have a CUDA GPU set up per `requirements.yml`, `ivfflat` can also be
+trained on the GPU with `FAISS_USE_GPU=1` -- this only speeds up the one-time
+build step (~1.7s vs ~446s on this project's dataset); the resulting index is
+converted back to a plain CPU index before being written, so no GPU is
+required later to load or query it:
+
+```
+FAISS_INDEX_TYPE=ivfflat FAISS_USE_GPU=1 python src/database/build_database.py
+```
+
 See `benchmarks/RESULTS.md` for build time / size / query latency / recall
 numbers for each type on this project's dataset, and how they were measured.
 

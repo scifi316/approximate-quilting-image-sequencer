@@ -22,6 +22,15 @@ INDEX_TYPES = ("flat", "hnsw", "ivfflat", "ivfpq")
 TRAINED_INDEX_TYPES = ("ivfflat", "ivfpq")
 DEFAULT_INDEX_TYPE = "hnsw"
 
+# GPU only meaningfully helps the types that need k-means training -- and of
+# those, only ivfflat was benchmarked on GPU (ivfpq's product-quantizer
+# training isn't exercised here). See benchmarks/RESULTS.md: ivfflat+gpu
+# trains in ~1.7s vs ~446s on CPU for this project's dataset, at a comparable
+# recall/query-latency profile to CPU ivfflat. The built index is converted
+# back to a CPU index before being written to disk, so it can still be
+# loaded and queried by stitch.py without a GPU at query time.
+GPU_INDEX_TYPES = ("ivfflat",)
+
 HNSW_M = 32  # neighbors per node; Faiss's own default
 IVF_PQ_SUBQUANTIZERS = 16  # DESCRIPTOR_DIM (128) must be divisible by this
 IVF_PQ_BITS = 8
@@ -65,7 +74,7 @@ def _createIndex(index_type, dim, num_descriptors=0):
     raise ValueError(f"Unknown Faiss index type {index_type!r}; choose from {INDEX_TYPES}.")
 
 
-def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYPE):
+def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYPE, use_gpu=False):
     """Build a Faiss index of individual SIFT descriptors from the MV frames,
     along with a mapping from each descriptor back to the frame it came from.
 
@@ -76,9 +85,21 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
     need a representative sample of vectors before training their cluster
     centroids, so for those, descriptors are collected across the pass and
     the index is trained and filled once at the end.
+
+    use_gpu=True moves that training+add step onto the GPU for index types
+    in GPU_INDEX_TYPES (see its docstring); the result is converted back to
+    a CPU index before being returned/written, so no GPU is needed to load
+    or query it afterward.
     """
     if index_type not in INDEX_TYPES:
         raise ValueError(f"Unknown Faiss index type {index_type!r}; choose from {INDEX_TYPES}.")
+
+    if use_gpu and index_type not in GPU_INDEX_TYPES:
+        raise ValueError(
+            f"use_gpu=True isn't supported for index_type {index_type!r}; choose from {GPU_INDEX_TYPES}."
+        )
+    if use_gpu and faiss.get_num_gpus() == 0:
+        raise RuntimeError("use_gpu=True was requested but Faiss reports no GPUs are available.")
 
     needs_training = index_type in TRAINED_INDEX_TYPES
 
@@ -128,14 +149,25 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
         )
         faiss_index = _createIndex(index_type, DESCRIPTOR_DIM, num_descriptors=len(all_descriptors))
         if len(all_descriptors) > 0:
-            faiss_index.train(all_descriptors)
-            faiss_index.add(all_descriptors)
+            gpu_resources = None
+            train_index = faiss_index
+            if use_gpu:
+                gpu_resources = faiss.StandardGpuResources()
+                train_index = faiss.index_cpu_to_gpu(gpu_resources, 0, faiss_index)
+
+            train_index.train(all_descriptors)
+            train_index.add(all_descriptors)
             # IVF indexes default to nprobe=1 (scanning a single inverted-list
             # cell per query), which tanks recall. nprobe is serialized with
             # the index, so setting it once here is enough for stitch.py's
             # faiss.read_index() to pick it up automatically.
-            if hasattr(faiss_index, "nprobe"):
-                faiss_index.nprobe = IVF_NPROBE
+            if hasattr(train_index, "nprobe"):
+                train_index.nprobe = IVF_NPROBE
+
+            # gpu_resources must stay alive for as long as train_index is
+            # used -- convert back to a CPU index now, while it's still in
+            # scope, rather than handing a GPU-backed index to the caller.
+            faiss_index = faiss.index_gpu_to_cpu(train_index) if use_gpu else train_index
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,5 +181,6 @@ def buildDatabase(mv_frames_folder, output_dir=".", index_type=DEFAULT_INDEX_TYP
 if __name__ == "__main__":
     mv_frames_folder = ROOT_DIR / 'data/images/input'
     index_type = os.environ.get('FAISS_INDEX_TYPE', DEFAULT_INDEX_TYPE)
-    buildDatabase(mv_frames_folder, output_dir=ROOT_DIR, index_type=index_type)
-    print(f"Faiss index ({index_type}) created and saved successfully.")
+    use_gpu = os.environ.get('FAISS_USE_GPU', '').lower() in ('1', 'true', 'yes')
+    buildDatabase(mv_frames_folder, output_dir=ROOT_DIR, index_type=index_type, use_gpu=use_gpu)
+    print(f"Faiss index ({index_type}{'+gpu' if use_gpu else ''}) created and saved successfully.")

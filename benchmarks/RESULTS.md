@@ -53,9 +53,12 @@ descriptors handed to `matchFeaturesBatch`.)
   683K-point training sample on CPU each iteration. `requirements.yml`
   already provisions CUDA + `faiss-gpu`, so this is effectively free for
   anyone running the documented conda environment on a CUDA machine.
-  `build_database.py` doesn't wire this up (yet) to keep the default path
-  GPU-independent, since `requirements.txt` (the pip-only path) only
-  provides `faiss-cpu`.
+  `build_database.py` wires this up as an opt-in (`use_gpu=True` /
+  `FAISS_USE_GPU=1`), not the default, since `requirements.txt` (the
+  pip-only path) only provides `faiss-cpu` and the default build path
+  should work without a GPU. The GPU is only used during training/add; the
+  result is converted back to a plain CPU index before being written, so no
+  GPU is needed later to load or query it.
 
 ## Default: `hnsw`
 
