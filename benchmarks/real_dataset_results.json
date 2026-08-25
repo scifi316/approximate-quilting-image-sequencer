@@ -1,0 +1,44 @@
+[
+  {
+    "index_type": "flat",
+    "build_time_s": 0.037660899994079955,
+    "size_bytes": 349855789,
+    "avg_query_latency_s": 67.42206889999943,
+    "recall_at_k": 1.0
+  },
+  {
+    "index_type": "ivfflat",
+    "build_time_s": 446.052042299998,
+    "size_bytes": 357041499,
+    "avg_query_latency_s": 0.09221320000142441,
+    "recall_at_k": 0.9922857142857143
+  },
+  {
+    "index_type": "hnsw",
+    "build_time_s": 8.724445100000594,
+    "size_bytes": 535806242,
+    "avg_query_latency_s": 0.012552900003356626,
+    "recall_at_k": 0.9885
+  },
+  {
+    "index_type": "ivfpq",
+    "build_time_s": 428.7630149999968,
+    "size_bytes": 18249860,
+    "avg_query_latency_s": 0.05333075000089593,
+    "recall_at_k": 0.7753571428571429
+  },
+  {
+    "index_type": "flat+gpu",
+    "build_time_s": 0.06885479999618838,
+    "size_bytes": 349855789,
+    "avg_query_latency_s": 0.07664345000011963,
+    "recall_at_k": 0.9982857142857143
+  },
+  {
+    "index_type": "ivfflat+gpu",
+    "build_time_s": 1.7106050000002142,
+    "size_bytes": 357041499,
+    "avg_query_latency_s": 0.011948400002438575,
+    "recall_at_k": 0.9908571428571429
+  }
+]
