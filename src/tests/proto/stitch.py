@@ -26,20 +26,44 @@ def splitImage(image, chunk_width, chunk_height):
     return chunks
 
 
-def detectFeatures(image_chunk, detector=None):
-    """Detect SIFT features in an image chunk.
+def detectFeaturesForChunks(image, chunks, chunk_width, chunk_height, detector=None):
+    """Detect SIFT features once for the whole target image, then bucket
+    each keypoint/descriptor into the chunk it falls in by pixel location.
 
     SIFT is used (rather than ORB) because the database built by
     build_database.py is indexed on 128-D SIFT descriptors; matching with a
     different descriptor type/dimensionality produces meaningless results.
-    Pass a shared `detector` to avoid the overhead of constructing a new
-    cv2.SIFT instance for every chunk.
+
+    Running detectAndCompute once per frame instead of once per chunk (there
+    are hundreds of chunks per frame) matters: SIFT pays fixed per-call
+    overhead (building a scale-space pyramid, etc.) on every call regardless
+    of how small the input is, so calling it per-chunk was the dominant cost
+    of processing a frame -- roughly 2/3 of total per-frame time, well above
+    the batched Faiss search itself. Pass a shared `detector` to also avoid
+    the overhead of constructing a new cv2.SIFT instance per frame.
+
+    Returns a list of descriptor arrays (or None where no keypoints fell in
+    that chunk), aligned with `chunks` (as produced by splitImage).
     """
     detector = detector or cv2.SIFT_create()
-    gray_chunk = cv2.cvtColor(image_chunk, cv2.COLOR_BGR2GRAY)
-    _, descriptors = detector.detectAndCompute(gray_chunk, None)
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keypoints, descriptors = detector.detectAndCompute(gray_image, None)
 
-    return descriptors
+    buckets = [[] for _ in chunks]
+    if not keypoints:
+        return [None] * len(chunks)
+
+    h, w = image.shape[:2]
+    num_cols = -(-w // chunk_width)  # ceil division, matches splitImage's chunk grid
+    num_rows = -(-h // chunk_height)
+
+    for keypoint, descriptor in zip(keypoints, descriptors):
+        x, y = keypoint.pt
+        col = min(max(int(x) // chunk_width, 0), num_cols - 1)
+        row = min(max(int(y) // chunk_height, 0), num_rows - 1)
+        buckets[row * num_cols + col].append(descriptor)
+
+    return [np.array(bucket, dtype='float32') if bucket else None for bucket in buckets]
 
 
 def _padOrValidateDescriptors(descriptors, faiss_index):
@@ -204,8 +228,9 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
     image_chunks = splitImage(target_image, chunk_width, chunk_height)
     detector = detector or cv2.SIFT_create()
 
-    # Detect features per chunk, then match all chunks in a single batched Faiss search
-    chunk_descriptors = [detectFeatures(chunk_data, detector) for _, _, chunk_data in image_chunks]
+    # Detect features once for the whole frame, bucket them per chunk, then
+    # match all chunks in a single batched Faiss search
+    chunk_descriptors = detectFeaturesForChunks(target_image, image_chunks, chunk_width, chunk_height, detector)
     matches = matchFeaturesBatch(chunk_descriptors, faiss_index, frame_ids, frame_to_descriptor_indices)
 
     chunk_results = [

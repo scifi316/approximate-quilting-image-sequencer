@@ -42,6 +42,105 @@ class TestSplitImage:
         np.testing.assert_array_equal(chunk, image)
 
 
+class _FakeKeypoint:
+    def __init__(self, x, y):
+        self.pt = (x, y)
+
+
+class _FakeDetector:
+    """Stub for cv2.SIFT_create() with fixed keypoints/descriptors, so
+    detectFeaturesForChunks' bucketing logic can be tested against known
+    pixel locations without depending on what real SIFT happens to find."""
+
+    def __init__(self, points_and_descriptors):
+        self._keypoints = [_FakeKeypoint(x, y) for x, y, _ in points_and_descriptors]
+        self._descriptors = (
+            np.array([d for _, _, d in points_and_descriptors], dtype='float32')
+            if points_and_descriptors else None
+        )
+
+    def detectAndCompute(self, image, mask):
+        return self._keypoints, self._descriptors
+
+
+def _checkerboard(size=64, square=8):
+    board = np.zeros((size, size), dtype=np.uint8)
+    for i in range(0, size, square):
+        for j in range(0, size, square):
+            if (i // square + j // square) % 2 == 0:
+                board[i:i + square, j:j + square] = 255
+    return cv2.cvtColor(board, cv2.COLOR_GRAY2BGR)
+
+
+class TestDetectFeaturesForChunks:
+    def test_buckets_keypoints_into_their_containing_chunk(self):
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)  # 3x2 grid, 6 chunks
+
+        detector = _FakeDetector([
+            (0.5, 0.5, [1, 1]),  # chunk (0, 0) -> position 0
+            (3.0, 0.0, [2, 2]),  # chunk (2, 0) -> position 1
+            (5.9, 3.9, [3, 3]),  # chunk (4, 2) -> position 5
+        ])
+
+        result = stitch.detectFeaturesForChunks(image, chunks, chunk_width=2, chunk_height=2, detector=detector)
+
+        assert len(result) == 6
+        np.testing.assert_array_equal(result[0], [[1, 1]])
+        np.testing.assert_array_equal(result[1], [[2, 2]])
+        assert result[2] is None
+        assert result[3] is None
+        assert result[4] is None
+        np.testing.assert_array_equal(result[5], [[3, 3]])
+
+    def test_no_keypoints_returns_all_none(self):
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)
+        detector = _FakeDetector([])
+
+        result = stitch.detectFeaturesForChunks(image, chunks, chunk_width=2, chunk_height=2, detector=detector)
+
+        assert result == [None] * len(chunks)
+
+    def test_multiple_keypoints_in_the_same_chunk_are_grouped(self):
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)
+        detector = _FakeDetector([(0.0, 0.0, [1, 0]), (1.5, 1.5, [0, 1])])
+
+        result = stitch.detectFeaturesForChunks(image, chunks, chunk_width=2, chunk_height=2, detector=detector)
+
+        assert len(result) == 1
+        np.testing.assert_array_equal(result[0], [[1, 0], [0, 1]])
+
+    def test_keypoint_beyond_the_last_chunk_boundary_clamps_instead_of_dropping(self):
+        # SIFT's sub-pixel keypoint refinement can place kp.pt fractionally
+        # outside [0, image_size) at the edges; this must clamp into the
+        # nearest real chunk rather than computing an out-of-range bucket.
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)
+        detector = _FakeDetector([(4.0, 4.0, [9, 9])])  # exactly at the image's far edge
+
+        result = stitch.detectFeaturesForChunks(image, chunks, chunk_width=2, chunk_height=2, detector=detector)
+
+        np.testing.assert_array_equal(result[3], [[9, 9]])  # bottom-right chunk
+
+    def test_total_bucketed_descriptors_matches_whole_image_detection(self):
+        # Sanity check against real SIFT (not the fake detector): every
+        # descriptor detectAndCompute finds on the whole image must land in
+        # exactly one chunk's bucket.
+        board = _checkerboard(size=64, square=8)
+        chunks = stitch.splitImage(board, chunk_width=16, chunk_height=16)
+        detector = cv2.SIFT_create()
+
+        result = stitch.detectFeaturesForChunks(board, chunks, chunk_width=16, chunk_height=16, detector=detector)
+
+        gray = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
+        _, whole_image_descriptors = detector.detectAndCompute(gray, None)
+
+        total_bucketed = sum(len(bucket) for bucket in result if bucket is not None)
+        assert total_bucketed == len(whole_image_descriptors)
+
+
 @pytest.fixture
 def small_index():
     """A tiny FAISS index with 3 frames of 2 descriptors each, well separated."""
