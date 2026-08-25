@@ -11,7 +11,7 @@ from collections import Counter
 root_dir = Path(__file__).resolve().parents[3]  # src/tests/proto --> $main dir
 sys.path.insert(0, str(root_dir))
 
-from src.common import list_image_files  # noqa: E402
+from src.common import computeTileDescriptors, list_image_files  # noqa: E402
 
 
 def splitImage(image, chunk_width, chunk_height):
@@ -210,15 +210,42 @@ def quiltImage(chunk_results, mv_frames_folder, target_image_shape, chunk_width,
     return quilted_image
 
 
+def _descriptorsForChunks(target_image, image_chunks, chunk_width, chunk_height, descriptor_type,
+                           detector, thumb_size):
+    """Dispatch to the configured descriptor extraction strategy. Must
+    produce the same result shape either way: a list of descriptor arrays
+    (or None), one per entry in image_chunks, in the same order."""
+    if descriptor_type == "sift":
+        return detectFeaturesForChunks(target_image, image_chunks, chunk_width, chunk_height, detector)
+
+    if descriptor_type == "tile":
+        # One dense descriptor per tile -- unlike SIFT, this never leaves a
+        # chunk with nothing to match on, which is what makes small chunk
+        # sizes (fine-grained quilting) viable. See
+        # src.common.computeTileDescriptors and benchmarks/RESULTS.md.
+        descriptors, _, _ = computeTileDescriptors(target_image, chunk_width, chunk_height, thumb_size)
+        return [row.reshape(1, -1) for row in descriptors]
+
+    raise ValueError(f"Unknown descriptor type {descriptor_type!r}; choose from 'sift' or 'tile'.")
+
+
 def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descriptor_indices,
                         mv_frames_folder, output_index, output_dir, chunk_width=96, chunk_height=72,
-                        detector=None):
+                        detector=None, descriptor_type="sift", thumb_size=4):
     """Process a single target image against an already-loaded Faiss index.
 
     faiss_index/frame_ids/frame_to_descriptor_indices are loaded once by the
     caller and reused across every target frame -- re-reading a
     multi-hundred-MB index file per frame made processing a whole video
-    prohibitively slow.
+    prohibitively slow. faiss_index may be CPU- or GPU-resident (Faiss's
+    search() API is the same either way); GPU placement is the caller's
+    responsibility (see _moveIndexToGpu), done once rather than per frame.
+
+    descriptor_type must match how the database faiss_index was built with
+    (build_database.buildDatabase's descriptor_type) -- "sift" and "tile"
+    index different, incompatible vector spaces, and chunk_width/
+    chunk_height/thumb_size must match what was used to build a "tile"
+    database, since tile descriptors are tied to a specific grid alignment.
     """
     # Load the target image
     target_image = cv2.imread(str(target_image_path))
@@ -229,9 +256,10 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
     image_chunks = splitImage(target_image, chunk_width, chunk_height)
     detector = detector or cv2.SIFT_create()
 
-    # Detect features once for the whole frame, bucket them per chunk, then
-    # match all chunks in a single batched Faiss search
-    chunk_descriptors = detectFeaturesForChunks(target_image, image_chunks, chunk_width, chunk_height, detector)
+    # Extract descriptors once for the whole frame, one entry per chunk,
+    # then match all chunks in a single batched Faiss search
+    chunk_descriptors = _descriptorsForChunks(target_image, image_chunks, chunk_width, chunk_height,
+                                               descriptor_type, detector, thumb_size)
     matches = matchFeaturesBatch(chunk_descriptors, faiss_index, frame_ids, frame_to_descriptor_indices)
 
     chunk_results = [
@@ -247,27 +275,51 @@ def processTargetImage(target_image_path, faiss_index, frame_ids, frame_to_descr
     cv2.imwrite(str(output_image_path), quilted_image)
 
 
+def _moveIndexToGpu(faiss_index):
+    """Move a CPU Faiss index onto the GPU for searching. Returns
+    (gpu_index, gpu_resources); gpu_resources must be kept alive by the
+    caller for as long as gpu_index is used -- freeing it invalidates the
+    index. Faiss's GPU backend doesn't support HNSW indexes."""
+    if isinstance(faiss_index, faiss.IndexHNSWFlat):
+        raise ValueError("HNSW indexes aren't supported on Faiss's GPU backend; build with flat or ivfflat instead.")
+    gpu_resources = faiss.StandardGpuResources()
+    gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, faiss_index)
+    return gpu_index, gpu_resources
+
+
 _worker_state = {}
 
 
 def _initWorker(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder,
-                 chunk_width, chunk_height, threads_per_worker):
+                 chunk_width, chunk_height, threads_per_worker, descriptor_type, thumb_size, use_gpu):
     """multiprocessing.Pool initializer: each worker loads its own copy of
     the Faiss index once (Faiss indexes aren't picklable/shareable across
     process boundaries) and caps its own thread pools -- otherwise every
     worker process would try to claim all available cores for its own
     Faiss search and SIFT calls, oversubscribing the machine instead of
-    dividing it up across workers."""
+    dividing it up across workers.
+
+    use_gpu moves each worker's own index copy onto the GPU once here
+    (not per frame) -- multiple worker processes then share the one GPU for
+    searching, same as they already share CPU cores for everything else.
+    """
     faiss.omp_set_num_threads(threads_per_worker)
     cv2.setNumThreads(1)
 
-    _worker_state["faiss_index"] = faiss.read_index(str(faiss_index_path))
+    faiss_index = faiss.read_index(str(faiss_index_path))
+    if use_gpu:
+        faiss_index, gpu_resources = _moveIndexToGpu(faiss_index)
+        _worker_state["gpu_resources"] = gpu_resources  # keep alive
+
+    _worker_state["faiss_index"] = faiss_index
     _worker_state["frame_ids"] = np.load(frame_ids_path)
     _worker_state["frame_to_descriptor_indices"] = np.load(descriptor_indices_path)
     _worker_state["mv_frames_folder"] = mv_frames_folder
     _worker_state["chunk_width"] = chunk_width
     _worker_state["chunk_height"] = chunk_height
-    _worker_state["detector"] = cv2.SIFT_create()
+    _worker_state["descriptor_type"] = descriptor_type
+    _worker_state["thumb_size"] = thumb_size
+    _worker_state["detector"] = cv2.SIFT_create() if descriptor_type == "sift" else None
 
 
 def _processOneFrameInWorker(args):
@@ -283,23 +335,30 @@ def _processOneFrameInWorker(args):
         chunk_width=_worker_state["chunk_width"],
         chunk_height=_worker_state["chunk_height"],
         detector=_worker_state["detector"],
+        descriptor_type=_worker_state["descriptor_type"],
+        thumb_size=_worker_state["thumb_size"],
     )
     return output_index
 
 
 def processTargetImagesParallel(target_image_dir, faiss_index_path, frame_ids_path, descriptor_indices_path,
                                  mv_frames_folder, output_dir, chunk_width=96, chunk_height=72,
-                                 num_workers=None, on_progress=None):
+                                 num_workers=None, on_progress=None, descriptor_type="sift", thumb_size=4,
+                                 use_gpu=False):
     """Process every target image in target_image_dir across multiple
     worker processes instead of one frame at a time in the calling process.
 
     Frames are independent -- each reads its own target image and writes
-    its own output file -- and per-frame cost is dominated by single-
-    threaded SIFT feature detection (see detectFeaturesForChunks), so this
-    scales with available cores in a way no further per-frame optimization
-    can. num_workers defaults to cpu_count() - 1. on_progress, if given, is
-    called with the number of frames completed so far after each one
-    finishes (order not guaranteed to match frame order).
+    its own output file -- so this parallelizes across cores in a way no
+    further per-frame optimization can. num_workers defaults to
+    cpu_count() - 1. on_progress, if given, is called with the number of
+    frames completed so far after each one finishes (order not guaranteed
+    to match frame order).
+
+    descriptor_type/chunk_width/chunk_height/thumb_size must match how the
+    database at faiss_index_path was built (build_database.buildDatabase).
+    use_gpu moves each worker's own Faiss index copy onto the GPU for
+    searching (not supported for HNSW-built indexes).
     """
     os.makedirs(output_dir, exist_ok=True)
     num_workers = max(1, num_workers or (multiprocessing.cpu_count() - 1))
@@ -318,7 +377,7 @@ def processTargetImagesParallel(target_image_dir, faiss_index_path, frame_ids_pa
         processes=num_workers,
         initializer=_initWorker,
         initargs=(faiss_index_path, frame_ids_path, descriptor_indices_path, mv_frames_folder,
-                  chunk_width, chunk_height, threads_per_worker),
+                  chunk_width, chunk_height, threads_per_worker, descriptor_type, thumb_size, use_gpu),
     ) as pool:
         for completed, _ in enumerate(pool.imap_unordered(_processOneFrameInWorker, tasks), start=1):
             if on_progress:
@@ -337,11 +396,20 @@ if __name__ == "__main__":
     output_dir = root_dir / 'data/images/quilted_output'
 
     # Frames are independent (each reads its own target image, writes its
-    # own output file), and per-frame cost is dominated by single-threaded
-    # SIFT detection, so this parallelizes across processes rather than
+    # own output file), so this parallelizes across processes rather than
     # processing one frame at a time. Override worker count with
     # QUILT_WORKERS=N; QUILT_WORKERS=1 falls back to effectively sequential.
     num_workers = int(os.environ.get('QUILT_WORKERS', 0)) or None
+    # Must match the database's build_database.py descriptor_type/chunk
+    # size/thumb_size (QUILT_DESCRIPTOR_TYPE/QUILT_CHUNK_WIDTH/
+    # QUILT_CHUNK_HEIGHT/QUILT_THUMB_SIZE there) -- these are two ends of
+    # the same descriptor space and will silently produce nonsense matches
+    # if mismatched.
+    descriptor_type = os.environ.get('QUILT_DESCRIPTOR_TYPE', 'sift')
+    chunk_width = int(os.environ.get('QUILT_CHUNK_WIDTH', 96))
+    chunk_height = int(os.environ.get('QUILT_CHUNK_HEIGHT', 72))
+    thumb_size = int(os.environ.get('QUILT_THUMB_SIZE', 4))
+    use_gpu = os.environ.get('QUILT_USE_GPU', '').lower() in ('1', 'true', 'yes')
     total_frames = len(list_image_files(target_image_path))
 
     def _report_progress(completed):
@@ -349,7 +417,8 @@ if __name__ == "__main__":
             print(f"  {completed}/{total_frames} frames quilted")
 
     processTargetImagesParallel(target_image_path, faiss_index_path, frame_ids_path, descriptor_indices_path,
-                                 mv_frames_folder, output_dir, num_workers=num_workers,
-                                 on_progress=_report_progress)
+                                 mv_frames_folder, output_dir, chunk_width=chunk_width, chunk_height=chunk_height,
+                                 num_workers=num_workers, on_progress=_report_progress,
+                                 descriptor_type=descriptor_type, thumb_size=thumb_size, use_gpu=use_gpu)
 
     print("Quilted all images")

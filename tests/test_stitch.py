@@ -444,3 +444,101 @@ class TestProcessTargetImagesParallel:
         )
 
         assert sorted(progress_calls) == [1, 2, 3]
+
+
+class TestDescriptorsForChunks:
+    def test_tile_mode_produces_one_descriptor_per_chunk(self):
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        image[0:2, 0:2] = (10, 20, 30)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)
+
+        result = stitch._descriptorsForChunks(image, chunks, 2, 2, "tile", detector=None, thumb_size=1)
+
+        assert len(result) == 4
+        for row in result:
+            assert row.shape == (1, 3)  # thumb_size=1, 3 channels
+        np.testing.assert_allclose(result[0][0], [10, 20, 30], atol=1)
+
+    def test_sift_mode_delegates_to_detectFeaturesForChunks(self):
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)
+        detector = _FakeDetector([(0.5, 0.5, [1, 1])])
+
+        result = stitch._descriptorsForChunks(image, chunks, 2, 2, "sift", detector=detector, thumb_size=4)
+
+        expected = stitch.detectFeaturesForChunks(image, chunks, 2, 2, detector)
+        assert len(result) == len(expected)
+        np.testing.assert_array_equal(result[0], expected[0])
+
+    def test_unknown_descriptor_type_raises(self):
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        chunks = stitch.splitImage(image, chunk_width=2, chunk_height=2)
+
+        with pytest.raises(ValueError):
+            stitch._descriptorsForChunks(image, chunks, 2, 2, "not_a_real_type", detector=None, thumb_size=4)
+
+
+class TestProcessTargetImageTileMode:
+    def test_produces_valid_output_using_a_tile_built_database(self, tmp_path):
+        import build_database
+
+        mv_frames_dir = tmp_path / "mv_frames"
+        mv_frames_dir.mkdir()
+        source_frame = np.full((8, 8, 3), 100, dtype=np.uint8)
+        source_frame[0:4, 0:4] = (200, 150, 50)
+        cv2.imwrite(str(mv_frames_dir / "frame0000.png"), source_frame)
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        build_database.buildDatabase(
+            mv_frames_dir, output_dir=db_dir, descriptor_type="tile",
+            chunk_width=4, chunk_height=4, thumb_size=2,
+        )
+
+        target_dir = tmp_path / "targets"
+        target_dir.mkdir()
+        cv2.imwrite(str(target_dir / "target0000.png"), source_frame)
+
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        faiss_index = stitch.faiss.read_index(str(db_dir / "individual_descriptors_faiss_index.bin"))
+        frame_ids = np.load(db_dir / "frame_ids.npy")
+        mapping = np.load(db_dir / "frame_to_descriptor_indices.npy")
+
+        stitch.processTargetImage(
+            str(target_dir / "target0000.png"), faiss_index, frame_ids, mapping,
+            str(mv_frames_dir), 1, str(output_dir),
+            chunk_width=4, chunk_height=4, descriptor_type="tile", thumb_size=2,
+        )
+
+        output_path = output_dir / "quilted_frame0001.png"
+        assert output_path.exists()
+        quilted = cv2.imread(str(output_path))
+        # quiltImage pastes a downscaled copy of the *whole* matched source
+        # frame into each chunk (the actual quilting aesthetic: a mosaic of
+        # whole-frame thumbnails), not the specific sub-region that matched.
+        # With only one candidate frame in the database, every chunk must
+        # match it, so every 4x4 position gets the same resized thumbnail.
+        expected_tile = cv2.resize(source_frame, (4, 4))
+        expected = np.tile(expected_tile, (2, 2, 1))
+        np.testing.assert_array_equal(quilted, expected)
+
+
+class TestMoveIndexToGpu:
+    def test_hnsw_index_is_rejected(self):
+        index = faiss.IndexHNSWFlat(4, 8)
+        with pytest.raises(ValueError):
+            stitch._moveIndexToGpu(index)
+
+    @pytest.mark.skipif(faiss.get_num_gpus() == 0, reason="requires a Faiss-visible GPU")
+    def test_gpu_index_returns_same_search_results_as_cpu(self, small_index):
+        cpu_index, frame_ids, mapping, vectors = small_index
+
+        gpu_index, gpu_resources = stitch._moveIndexToGpu(cpu_index)
+        try:
+            cpu_distances, cpu_indices = cpu_index.search(vectors, 2)
+            gpu_distances, gpu_indices = gpu_index.search(vectors, 2)
+            np.testing.assert_array_equal(cpu_indices, gpu_indices)
+        finally:
+            del gpu_index, gpu_resources
